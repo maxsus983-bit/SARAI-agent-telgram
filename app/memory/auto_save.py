@@ -14,8 +14,16 @@ async def save_extracted_user_memories(
 
     for memory in memories:
 
-        # GROUP_FACT shaxsiy xotiraga tushmasin.
+        # Guruh xotirasi user xotirasiga tushmasin.
         if memory.memory_type == "GROUP_FACT":
+            continue
+
+        # Juda past ishonchli xotiralarni saqlamaymiz.
+        if memory.confidence < 0.50:
+            continue
+
+        # Juda past ahamiyatli ma'lumotlarni saqlamaymiz.
+        if memory.importance < 20:
             continue
 
         await memory_manager.save_user_memory(
@@ -43,6 +51,12 @@ async def save_extracted_group_memories(
     for memory in memories:
 
         if memory.memory_type != "GROUP_FACT":
+            continue
+
+        if memory.confidence < 0.50:
+            continue
+
+        if memory.importance < 20:
             continue
 
         await memory_manager.save_group_memory(
