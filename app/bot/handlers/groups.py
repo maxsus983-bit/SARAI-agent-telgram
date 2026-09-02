@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 from aiogram import Router
@@ -12,182 +13,295 @@ from app.services.message_service import message_service
 from app.services.user_service import user_service
 
 
-router = Router(name="groups")
+logger = logging.getLogger("sara.bot.groups")
+
+router = Router(name="group_messages")
 
 
-def clean_mention(
-    text: str,
-    bot_username: str | None,
-) -> str:
+# ================================================================
+# SARA MENTION / CALL DETECTION
+# ================================================================
 
-    if not bot_username:
-        return text.strip()
-
-    pattern = rf"@{re.escape(bot_username)}"
-
-    return re.sub(
-        pattern,
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
+SARA_WORD_PATTERN = re.compile(
+    r"(?<!\w)sara(?!\w)",
+    re.IGNORECASE,
+)
 
 
-def is_sara_called(
-    message: Message,
-) -> bool:
+def is_sara_called(message: Message) -> bool:
+    """
+    SARA chaqirilganligini aniqlaydi.
+
+    Quyidagilar ishlaydi:
+
+        sara
+        Sara
+        SARA
+        @sara_bot
+        sara yordam ber
+        @sara_bot nima deb o'ylaysan?
+
+    Bundan tashqari:
+    - SARA yozgan xabarga reply
+    """
+
+    if message.from_user is None:
+        return False
+
+    # ------------------------------------------------------------
+    # 1. SARA botiga reply qilinganmi?
+    # ------------------------------------------------------------
+
+    if message.reply_to_message:
+        replied_user = message.reply_to_message.from_user
+
+        if replied_user and replied_user.is_bot:
+            return True
+
+    # ------------------------------------------------------------
+    # 2. Text yo'q bo'lsa, chaqiruvni aniqlab bo'lmaydi
+    # ------------------------------------------------------------
 
     if not message.text:
         return False
 
-    text = message.text.lower()
+    text = message.text.strip()
 
-    # Bot username orqali chaqirish.
-    if message.entities:
+    if not text:
+        return False
 
-        for entity in message.entities:
+    # ------------------------------------------------------------
+    # 3. "sara" so'zi
+    # ------------------------------------------------------------
 
-            if entity.type == "mention":
-
-                mention = message.text[
-                    entity.offset:
-                    entity.offset + entity.length
-                ]
-
-                if (
-                    message.bot.username
-                    and mention.lower()
-                    == f"@{message.bot.username}".lower()
-                ):
-                    return True
-
-    # SARA nomi.
-    words = re.findall(
-        r"\b[\w'-]+\b",
-        text,
-    )
-
-    if "sara" in words:
+    if SARA_WORD_PATTERN.search(text):
         return True
 
-    # Botga reply.
-    if message.reply_to_message:
-        replied = message.reply_to_message
+    # ------------------------------------------------------------
+    # 4. @bot_username orqali mention
+    # ------------------------------------------------------------
 
-        if replied.from_user:
+    if message.bot:
+        bot_username = None
 
-            if replied.from_user.id == message.bot.id:
+        # Telegram bot username'ini olishga har safar API chaqirmaslik
+        # uchun oddiy cache ishlatamiz.
+        bot_username = getattr(message.bot, "_sara_username", None)
+
+        if not bot_username:
+            try:
+                bot_info = await_bot_info(message)
+                bot_username = bot_info
+            except Exception:
+                bot_username = None
+
+        if bot_username:
+            mention = f"@{bot_username.lower()}"
+
+            if mention in text.lower():
                 return True
 
     return False
 
 
-@router.message(
-    lambda message:
-    message.chat.type in {
-        "group",
-        "supergroup",
-    }
-)
-async def group_message(
-    message: Message,
-) -> None:
+async def await_bot_info(message: Message) -> str | None:
+    """
+    Bot username'ini olish.
 
-    if not message.from_user:
+    Ayrim holatlarda message.bot username'ini to'g'ridan-to'g'ri
+    bermaydi, shuning uchun get_me() ishlatiladi.
+    """
+
+    try:
+        me = await message.bot.get_me()
+
+        username = me.username
+
+        if username:
+            setattr(message.bot, "_sara_username", username)
+            return username
+
+    except Exception:
+        logger.exception("Failed to get bot information.")
+
+    return None
+
+
+def clean_group_message(message: Message) -> str:
+    """
+    AI ga yuborishdan oldin SARA chaqiruvini olib tashlaydi.
+
+    Masalan:
+
+        "sara bugun nima qilamiz?"
+
+    ->
+
+        "bugun nima qilamiz?"
+
+    @sara_bot mention ham olib tashlanadi.
+    """
+
+    text = message.text or ""
+
+    # "sara" so'zini olib tashlash
+    text = SARA_WORD_PATTERN.sub("", text)
+
+    # @username mentionini olib tashlash
+    if message.bot:
+        username = getattr(message.bot, "_sara_username", None)
+
+        if username:
+            text = re.sub(
+                rf"@{re.escape(username)}",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+    # Ortiqcha bo'shliqlar
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+@router.message(
+    lambda message: message.chat.type in {"group", "supergroup"}
+)
+async def handle_group_message(message: Message) -> None:
+    """
+    SARA AI — Group / Supergroup Handler.
+
+    Guruhdagi barcha text xabarlarni DB ga yozadi.
+
+    Ammo AI faqat:
+    - "sara" deyilganda
+    - @sara_bot mention qilinganda
+    - SARA xabariga reply qilinganda
+
+    javob beradi.
+    """
+
+    if message.from_user is None:
         return
 
     if not message.text:
         return
 
-    # ----------------------------------------------------------
-    # GROUP
-    # ----------------------------------------------------------
+    user = message.from_user
+    chat = message.chat
+    chat_id = chat.id
 
-    group = await group_service.get_or_create(
-        message.chat
-    )
+    try:
+        # =========================================================
+        # 1. GROUPNI DATABASE GA SAQLASH
+        # =========================================================
 
-    if not group.enabled:
-        return
+        db_group = await group_service.get_or_create(chat)
 
-    # ----------------------------------------------------------
-    # MESSAGE
-    # ----------------------------------------------------------
+        # =========================================================
+        # 2. USERNI DATABASE GA SAQLASH
+        # =========================================================
 
-    await message_service.save(
-        chat_id=message.chat.id,
-        telegram_message_id=message.message_id,
-        user_telegram_id=message.from_user.id,
-        role="user",
-        content=message.text,
-        message_type="text",
-        reply_to_message_id=(
-            message.reply_to_message.message_id
-            if message.reply_to_message
-            else None
-        ),
-        is_bot_message=False,
-    )
+        db_user = await user_service.get_or_create(user)
 
-    # SARA chaqirilmagan bo'lsa,
-    # xabar database'da qoladi,
-    # lekin javob bermaydi.
+        # =========================================================
+        # 3. GURUH XABARINI DATABASE GA SAQLASH
+        # =========================================================
 
-    if not is_sara_called(message):
-        return
+        saved_message = await message_service.save(
+            telegram_message_id=message.message_id,
+            chat_id=chat_id,
+            user_telegram_id=user.id,
+            role="user",
+            content=message.text,
+            message_type="text",
+            reply_to_message_id=(
+                message.reply_to_message.message_id
+                if message.reply_to_message
+                else None
+            ),
+            is_bot_message=False,
+        )
 
-    # ----------------------------------------------------------
-    # USER
-    # ----------------------------------------------------------
+        # =========================================================
+        # 4. SARA CHAQRILGANMI?
+        # =========================================================
 
-    user = await user_service.get_or_create(
-        message.from_user
-    )
+        called = await is_sara_called(message)
 
-    # ----------------------------------------------------------
-    # REMOVE MENTION
-    # ----------------------------------------------------------
+        # SARA chaqirilmagan bo'lsa:
+        # xabar DB da qoladi, lekin AI javob bermaydi.
+        if not called:
+            return
 
-    text = clean_mention(
-        message.text,
-        message.bot.username,
-    )
+        # =========================================================
+        # 5. SARA MENTIONINI TOZALASH
+        # =========================================================
 
-    if not text:
-        text = "Salom SARA"
+        cleaned_text = clean_group_message(message)
 
-    # ----------------------------------------------------------
-    # AI
-    # ----------------------------------------------------------
+        # Agar xabarda faqat "sara" bo'lgan bo'lsa
+        if not cleaned_text:
+            cleaned_text = (
+                "Meni chaqirishdi. Guruhdagi suhbatni hisobga olib "
+                "foydali javob ber."
+            )
 
-    answer = await ai_engine.generate(
-        user_text=text,
-        chat_id=message.chat.id,
-        user_id=user.telegram_id,
-        group_id=group.telegram_id,
-    )
+        # =========================================================
+        # 6. AI GA YUBORISH
+        # =========================================================
 
-    # ----------------------------------------------------------
-    # SAVE AI MESSAGE
-    # ----------------------------------------------------------
+        answer = await ai_engine.generate(
+            user_text=cleaned_text,
+            chat_id=chat_id,
+            user_id=db_user.telegram_id,
+            group_id=db_group.telegram_id,
+            source_message_id=saved_message.id,
+        )
 
-    await message_service.save(
-        chat_id=message.chat.id,
-        telegram_message_id=None,
-        user_telegram_id=user.telegram_id,
-        role="assistant",
-        content=answer,
-        message_type="text",
-        is_bot_message=True,
-    )
+        # =========================================================
+        # 7. AI JAVOBINI DATABASE GA SAQLASH
+        # =========================================================
 
-    # ----------------------------------------------------------
-    # SEND
-    # ----------------------------------------------------------
+        await message_service.save(
+            telegram_message_id=None,
+            chat_id=chat_id,
+            user_telegram_id=None,
+            role="assistant",
+            content=answer,
+            message_type="text",
+            reply_to_message_id=message.message_id,
+            is_bot_message=True,
+        )
 
-    await send_answer(
-        bot=message.bot,
-        chat_id=message.chat.id,
-        text=answer,
-        reply_to_message_id=message.message_id,
-  )
+        # =========================================================
+        # 8. GURUHGA JAVOB YUBORISH
+        # =========================================================
+
+        await send_answer(
+            bot=message.bot,
+            chat_id=chat_id,
+            text=answer,
+            reply_to_message_id=message.message_id,
+        )
+
+        logger.info(
+            "Group message processed | user=%s | group=%s",
+            user.id,
+            chat_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Group message processing failed | user=%s | group=%s",
+            user.id,
+            chat_id,
+        )
+
+        try:
+            await message.answer(
+                "Xabarni qayta ishlashda muammo yuz berdi."
+            )
+        except Exception:
+            logger.exception("Failed to send group error message.")
