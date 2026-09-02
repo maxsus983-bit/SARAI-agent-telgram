@@ -10,6 +10,8 @@ from app.bot.router import create_router
 from app.config.settings import settings
 from app.database.init import init_database
 from app.database.session import close_database
+from app.scheduler.manager import scheduler_manager
+from app.scheduler.recovery import restore_reminders
 
 
 logging.basicConfig(
@@ -26,10 +28,15 @@ logging.basicConfig(
     ),
 )
 
+
 logger = logging.getLogger("sara")
 
 
 async def main() -> None:
+
+    # ============================================================
+    # CONFIG CHECK
+    # ============================================================
 
     if not settings.bot_token:
         raise RuntimeError(
@@ -49,18 +56,16 @@ async def main() -> None:
     logger.info(
         "=========================================="
     )
-
     logger.info(
-        "        SARA AI STARTING"
+        "          SARA AI STARTING"
     )
-
     logger.info(
         "=========================================="
     )
 
-    # ----------------------------------------------------------
+    # ============================================================
     # DATABASE
-    # ----------------------------------------------------------
+    # ============================================================
 
     logger.info(
         "Database ishga tushirilmoqda..."
@@ -72,9 +77,9 @@ async def main() -> None:
         "Database tayyor."
     )
 
-    # ----------------------------------------------------------
+    # ============================================================
     # BOT
-    # ----------------------------------------------------------
+    # ============================================================
 
     bot = Bot(
         token=settings.bot_token
@@ -86,6 +91,18 @@ async def main() -> None:
         create_router()
     )
 
+    # ============================================================
+    # SCHEDULER BOT BILAN BOG'LANADI
+    # ============================================================
+
+    scheduler_manager.set_bot(
+        bot
+    )
+
+    # ============================================================
+    # START
+    # ============================================================
+
     try:
 
         me = await bot.get_me()
@@ -95,13 +112,49 @@ async def main() -> None:
             me.username,
         )
 
-        logger.info(
-            "SARA AI ishga tushdi."
-        )
+        # --------------------------------------------------------
+        # Webhookni tozalash
+        # --------------------------------------------------------
 
-        # Eski pending update'larni tashlab yuborish.
         await bot.delete_webhook(
             drop_pending_updates=True
+        )
+
+        # --------------------------------------------------------
+        # Scheduler start
+        # --------------------------------------------------------
+
+        if settings.reminder_enabled:
+
+            scheduler_manager.start()
+
+            logger.info(
+                "Reminder Scheduler ishga tushdi."
+            )
+
+            # ----------------------------------------------------
+            # Restartdan keyingi recovery
+            # ----------------------------------------------------
+
+            restored = await restore_reminders()
+
+            logger.info(
+                "Restart recovery: %s ta reminder tiklandi.",
+                restored,
+            )
+
+        else:
+
+            logger.info(
+                "Reminder system .env orqali o'chirilgan."
+            )
+
+        # --------------------------------------------------------
+        # POLLING
+        # --------------------------------------------------------
+
+        logger.info(
+            "SARA AI ishga tushdi."
         )
 
         await dispatcher.start_polling(
@@ -114,20 +167,56 @@ async def main() -> None:
             "SARA AI to'xtatilmoqda..."
         )
 
-        await bot.session.close()
+        # --------------------------------------------------------
+        # Scheduler stop
+        # --------------------------------------------------------
 
-        await close_database()
+        try:
+            await scheduler_manager.stop()
+        except Exception:
+            logger.exception(
+                "Scheduler stop xatosi."
+            )
+
+        # --------------------------------------------------------
+        # Bot close
+        # --------------------------------------------------------
+
+        try:
+            await bot.session.close()
+        except Exception:
+            logger.exception(
+                "Telegram session close xatosi."
+            )
+
+        # --------------------------------------------------------
+        # Database close
+        # --------------------------------------------------------
+
+        try:
+            await close_database()
+        except Exception:
+            logger.exception(
+                "Database close xatosi."
+            )
+
+        logger.info(
+            "SARA AI to'xtadi."
+        )
 
 
 if __name__ == "__main__":
 
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
         logger.info(
-            "SARA AI to'xtatildi."
+            "SARA AI foydalanuvchi tomonidan to'xtatildi."
         )
 
     except Exception:
