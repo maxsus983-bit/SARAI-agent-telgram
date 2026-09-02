@@ -1,0 +1,917 @@
+from __future__ import annotations
+
+import logging
+
+from aiogram import Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+
+from app.config.settings import settings
+from app.memory.manager import memory_manager
+from app.services.group_service import group_service
+from app.services.permission_service import permission_service
+from app.scheduler.reminders import (
+    cancel_reminder_by_id,
+    create_reminder_from_text,
+    get_user_reminders,
+)
+
+logger = logging.getLogger("sara.bot.commands")
+
+router = Router(name="commands")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+
+def get_command_args(message: Message) -> str:
+    """
+    Telegram commanddan keyingi argumentlarni oladi.
+
+    Masalan:
+
+        /memory search minecraft
+
+    natija:
+
+        search minecraft
+    """
+
+    text = message.text or ""
+
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        return ""
+
+    return parts[1].strip()
+
+
+def split_args(message: Message) -> list[str]:
+    args = get_command_args(message)
+
+    if not args:
+        return []
+
+    return args.split()
+
+
+def format_memory(memory) -> str:
+    """
+    UserMemory obyektini foydalanuvchiga
+    tushunarli formatga o'tkazadi.
+    """
+
+    return (
+        f"🧠 <b>#{memory.id}</b>\n"
+        f"📌 Type: <code>{memory.memory_type}</code>\n"
+        f"⭐ Importance: <code>{memory.importance}/100</code>\n"
+        f"🎯 Confidence: <code>{memory.confidence:.2f}</code>\n"
+        f"📝 {memory.content}"
+    )
+
+
+def format_group_memory(memory) -> str:
+    """
+    GroupMemory obyektini formatlaydi.
+    """
+
+    return (
+        f"🏷 <b>#{memory.id}</b>\n"
+        f"📌 Type: <code>{memory.memory_type}</code>\n"
+        f"⭐ Importance: <code>{memory.importance}/100</code>\n"
+        f"🎯 Confidence: <code>{memory.confidence:.2f}</code>\n"
+        f"📝 {memory.content}"
+    )
+
+
+async def is_group_admin(message: Message) -> bool:
+    """
+    User guruh adminimi yoki yo'qmi.
+    """
+
+    if message.chat.type not in {"group", "supergroup"}:
+        return False
+
+    if message.from_user is None:
+        return False
+
+    return await permission_service.can_manage_group_async(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        user_id=message.from_user.id,
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+
+@router.message(CommandStart())
+async def command_start(message: Message) -> None:
+    await message.answer(
+        "👋 <b>Salom!</b>\n\n"
+        "Men <b>SARA AI</b>.\n\n"
+        "Men suhbatni tushunaman, xotiralarni saqlayman, "
+        "reminder yarataman va guruhdagi suhbatni ham kuzata olaman.\n\n"
+        "🧠 <b>Xotira:</b> /memory\n"
+        "⏰ <b>Reminder:</b> /remind\n"
+        "❓ <b>Yordam:</b> /help"
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+
+@router.message(Command("help"))
+async def command_help(message: Message) -> None:
+    await message.answer(
+        """
+<b>🤖 SARA AI — COMMANDS</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>🧠 MEMORY</b>
+
+<code>/memory</code>
+Saqlangan xotiralarni ko'rish.
+
+<code>/memory list</code>
+Xotiralar ro'yxati.
+
+<code>/memory search matn</code>
+Xotiralardan qidirish.
+
+<code>/memory stats</code>
+Xotira statistikasi.
+
+<code>/forget ID</code>
+Bitta xotirani o'chirish.
+
+<code>/forget_all CONFIRM</code>
+Barcha shaxsiy xotirani o'chirish.
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>👥 GROUP MEMORY</b>
+
+<code>/group_memory</code>
+Guruh xotirasini ko'rish.
+
+<code>/group_memory search matn</code>
+Guruh xotirasidan qidirish.
+
+<code>/group_memory_clear CONFIRM</code>
+Guruh xotirasini tozalash.
+(Faqat admin)
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>⏰ REMINDERS</b>
+
+<code>/remind 10 daqiqadan keyin menga yoz</code>
+
+<code>/reminders</code>
+Reminderlarni ko'rish.
+
+<code>/cancel_reminder ID</code>
+Reminderni bekor qilish.
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>🔐 PRIVACY</b>
+
+Shaxsiy memory faqat uni yaratgan
+foydalanuvchining private contextida ishlatiladi.
+
+Guruhda private user memory
+boshqa odamlarga ko'rsatilmaydi.
+
+━━━━━━━━━━━━━━━━━━━━
+
+SARA AI
+🧠 Memory
+🤖 AI
+⏰ Scheduler
+👥 Group Intelligence
+🔐 Privacy
+""".strip()
+    )
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+
+@router.message(Command("memory"))
+async def command_memory(message: Message) -> None:
+    """
+    /memory
+    /memory list
+    /memory search ...
+    /memory stats
+    """
+
+    if message.from_user is None:
+        return
+
+    args = get_command_args(message)
+
+    # --------------------------------------------------------
+    # /memory
+    # /memory list
+    # --------------------------------------------------------
+
+    if not args or args.lower() == "list":
+
+        memories = await memory_manager.get_user_memories(
+            user_telegram_id=message.from_user.id,
+            limit=settings.max_memory_results,
+        )
+
+        if not memories:
+            await message.answer(
+                "🧠 Hozircha sen haqingda saqlangan "
+                "xotira yo'q."
+            )
+            return
+
+        lines = [
+            "<b>🧠 Sening xotiralaring</b>",
+            "",
+        ]
+
+        for memory in memories:
+            lines.append(format_memory(memory))
+            lines.append("")
+
+        lines.append(
+            "O'chirish: <code>/forget ID</code>"
+        )
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /memory search TEXT
+    # --------------------------------------------------------
+
+    parts = args.split(maxsplit=1)
+
+    action = parts[0].lower()
+
+    if action == "search":
+
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "🔎 Qidirish uchun matn yoz.\n\n"
+                "Misol:\n"
+                "<code>/memory search minecraft</code>"
+            )
+            return
+
+        query = parts[1].strip()
+
+        memories = await memory_manager.search_user_memories(
+            user_telegram_id=message.from_user.id,
+            search_text=query,
+            limit=settings.max_memory_results,
+        )
+
+        if not memories:
+            await message.answer(
+                f"🔎 <b>{query}</b> bo'yicha xotira topilmadi.",
+                parse_mode="HTML",
+            )
+            return
+
+        lines = [
+            f"🔎 <b>Qidiruv:</b> {query}",
+            "",
+        ]
+
+        for memory in memories:
+            lines.append(format_memory(memory))
+            lines.append("")
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /memory stats
+    # --------------------------------------------------------
+
+    if action == "stats":
+
+        count = await memory_manager.user_memory_count(
+            user_telegram_id=message.from_user.id
+        )
+
+        await message.answer(
+            "📊 <b>Memory Statistics</b>\n\n"
+            f"🧠 Saqlangan memory: <b>{count}</b>\n"
+            f"📦 Maksimal ko'rsatiladigan: "
+            f"<b>{settings.max_memory_results}</b>\n"
+            f"💾 Memory system: "
+            f"<b>{'ON' if settings.memory_enabled else 'OFF'}</b>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Noma'lum action
+    # --------------------------------------------------------
+
+    await message.answer(
+        "❓ Noma'lum memory command.\n\n"
+        "Foydalanish:\n"
+        "<code>/memory</code>\n"
+        "<code>/memory list</code>\n"
+        "<code>/memory search matn</code>\n"
+        "<code>/memory stats</code>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# MEMORY STATS SHORTCUT
+# ============================================================
+
+
+@router.message(Command("memory_stats"))
+async def command_memory_stats(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    count = await memory_manager.user_memory_count(
+        user_telegram_id=message.from_user.id
+    )
+
+    await message.answer(
+        "📊 <b>SARA Memory Statistics</b>\n\n"
+        f"🧠 User memories: <b>{count}</b>\n"
+        f"💾 Memory enabled: "
+        f"<b>{'YES' if settings.memory_enabled else 'NO'}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# MEMORY SEARCH SHORTCUT
+# ============================================================
+
+
+@router.message(Command("memory_search"))
+async def command_memory_search(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    query = get_command_args(message)
+
+    if not query:
+        await message.answer(
+            "🔎 Qidiruv matnini yoz.\n\n"
+            "Misol:\n"
+            "<code>/memory_search Minecraft</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    memories = await memory_manager.search_user_memories(
+        user_telegram_id=message.from_user.id,
+        search_text=query,
+        limit=settings.max_memory_results,
+    )
+
+    if not memories:
+        await message.answer(
+            "🔎 Xotira topilmadi.",
+        )
+        return
+
+    lines = [
+        f"🔎 <b>{query}</b> bo'yicha natijalar:",
+        "",
+    ]
+
+    for memory in memories:
+        lines.append(format_memory(memory))
+        lines.append("")
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# FORGET ONE MEMORY
+# ============================================================
+
+
+@router.message(Command("forget"))
+async def command_forget(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    args = split_args(message)
+
+    if not args:
+        await message.answer(
+            "🗑 Qaysi memoryni o'chirishni ko'rsat.\n\n"
+            "Misol:\n"
+            "<code>/forget 12</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        memory_id = int(args[0])
+    except ValueError:
+        await message.answer(
+            "❌ Memory ID raqam bo'lishi kerak.\n\n"
+            "Misol: <code>/forget 12</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    success = await memory_manager.forget_user_memory(
+        user_telegram_id=message.from_user.id,
+        memory_id=memory_id,
+    )
+
+    if success:
+        await message.answer(
+            f"🗑 <b>#{memory_id}</b> memory o'chirildi.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"❌ <b>#{memory_id}</b> memory topilmadi "
+            "yoki u senga tegishli emas.",
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# FORGET ALL
+# ============================================================
+
+
+@router.message(Command("forget_all"))
+async def command_forget_all(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    args = split_args(message)
+
+    if not args or args[0].upper() != "CONFIRM":
+        count = await memory_manager.user_memory_count(
+            user_telegram_id=message.from_user.id
+        )
+
+        await message.answer(
+            "⚠️ <b>DIQQAT!</b>\n\n"
+            f"Senda <b>{count}</b> ta shaxsiy memory mavjud.\n\n"
+            "Ularning barchasi o'chiriladi.\n"
+            "Bu amalni qaytarib bo'lmaydi.\n\n"
+            "Tasdiqlash uchun:\n"
+            "<code>/forget_all CONFIRM</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    deleted = await memory_manager.clear_user_memories(
+        user_telegram_id=message.from_user.id
+    )
+
+    await message.answer(
+        "🗑 <b>Barcha shaxsiy memory o'chirildi.</b>\n\n"
+        f"O'chirilgan: <b>{deleted}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# GROUP MEMORY
+# ============================================================
+
+
+@router.message(Command("group_memory"))
+async def command_group_memory(message: Message) -> None:
+    if message.chat.type not in {"group", "supergroup"}:
+        await message.answer(
+            "👥 Bu command faqat guruhda ishlaydi."
+        )
+        return
+
+    args = get_command_args(message)
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
+    parts = args.split(maxsplit=1) if args else []
+
+    if parts and parts[0].lower() == "search":
+
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "🔎 Qidiruv matnini yoz.\n\n"
+                "Misol:\n"
+                "<code>/group_memory search minecraft</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        query = parts[1].strip()
+
+        memories = await memory_manager.search_group_memories(
+            group_telegram_id=message.chat.id,
+            search_text=query,
+            limit=settings.max_memory_results,
+        )
+
+        if not memories:
+            await message.answer(
+                "🔎 Guruh xotirasidan hech narsa topilmadi."
+            )
+            return
+
+        lines = [
+            f"👥🔎 <b>Guruh memory qidiruvi:</b> {query}",
+            "",
+        ]
+
+        for memory in memories:
+            lines.append(format_group_memory(memory))
+            lines.append("")
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # LIST
+    # --------------------------------------------------------
+
+    memories = await memory_manager.get_group_memories(
+        group_telegram_id=message.chat.id,
+        limit=settings.max_memory_results,
+    )
+
+    if not memories:
+        await message.answer(
+            "👥🧠 Bu guruh uchun hozircha saqlangan "
+            "memory yo'q."
+        )
+        return
+
+    lines = [
+        f"👥 <b>{message.chat.title or 'Guruh'} memory</b>",
+        "",
+    ]
+
+    for memory in memories:
+        lines.append(format_group_memory(memory))
+        lines.append("")
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# GROUP MEMORY CLEAR
+# ============================================================
+
+
+@router.message(Command("group_memory_clear"))
+async def command_group_memory_clear(message: Message) -> None:
+    if message.chat.type not in {"group", "supergroup"}:
+        await message.answer(
+            "👥 Bu command faqat guruhda ishlaydi."
+        )
+        return
+
+    if message.from_user is None:
+        return
+
+    is_admin = await is_group_admin(message)
+
+    if not is_admin:
+        await message.answer(
+            "🔐 Bu amalni faqat guruh administratori bajarishi mumkin."
+        )
+        return
+
+    args = split_args(message)
+
+    if not args or args[0].upper() != "CONFIRM":
+
+        memories = await memory_manager.get_group_memories(
+            group_telegram_id=message.chat.id,
+            limit=1,
+        )
+
+        await message.answer(
+            "⚠️ <b>GROUP MEMORY CLEAR</b>\n\n"
+            "Bu guruhning barcha umumiy memorylarini "
+            "o'chiradi.\n\n"
+            "Tasdiqlash uchun:\n"
+            "<code>/group_memory_clear CONFIRM</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    deleted = await memory_manager.clear_group_memories(
+        group_telegram_id=message.chat.id
+    )
+
+    await message.answer(
+        "🗑 <b>Guruh memory tozalandi.</b>\n\n"
+        f"O'chirilgan: <b>{deleted}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# REMINDER
+# ============================================================
+
+
+@router.message(Command("remind"))
+async def command_remind(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    text = get_command_args(message)
+
+    if not text:
+        await message.answer(
+            "⏰ Reminder matnini yoz.\n\n"
+            "Misol:\n"
+            "<code>/remind 10 daqiqadan keyin menga yoz</code>\n\n"
+            "Yoki:\n"
+            "<code>/remind tomorrow 10:00 loyiha haqida eslat</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        reminder = await create_reminder_from_text(
+            owner_telegram_id=message.from_user.id,
+            chat_id=message.chat.id,
+            text=text,
+        )
+
+        await message.answer(
+            "⏰ <b>Reminder yaratildi!</b>\n\n"
+            f"📝 {reminder.text}\n"
+            f"🕐 <code>{reminder.remind_at}</code>\n"
+            f"🆔 <code>{reminder.id}</code>",
+            parse_mode="HTML",
+        )
+
+    except ValueError as exc:
+        await message.answer(
+            f"❌ {str(exc)}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Reminder yaratishda xato | user=%s",
+            message.from_user.id,
+        )
+
+        await message.answer(
+            "❌ Reminder yaratishda xatolik yuz berdi."
+        )
+
+
+# ============================================================
+# REMINDERS LIST
+# ============================================================
+
+
+@router.message(Command("reminders"))
+async def command_reminders(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    reminders = await get_user_reminders(
+        owner_telegram_id=message.from_user.id
+    )
+
+    if not reminders:
+        await message.answer(
+            "⏰ Hozircha aktiv reminder yo'q."
+        )
+        return
+
+    lines = [
+        "⏰ <b>Sening reminderlaring</b>",
+        "",
+    ]
+
+    for reminder in reminders:
+        status = "❌" if reminder.cancelled else "⏳"
+
+        lines.append(
+            f"{status} <b>#{reminder.id}</b>\n"
+            f"📝 {reminder.text}\n"
+            f"🕐 <code>{reminder.remind_at}</code>"
+        )
+
+        lines.append("")
+
+    lines.append(
+        "Bekor qilish:\n"
+        "<code>/cancel_reminder ID</code>"
+    )
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# CANCEL REMINDER
+# ============================================================
+
+
+@router.message(Command("cancel_reminder"))
+async def command_cancel_reminder(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    args = split_args(message)
+
+    if not args:
+        await message.answer(
+            "❌ Reminder ID yoz.\n\n"
+            "Misol:\n"
+            "<code>/cancel_reminder 15</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        reminder_id = int(args[0])
+    except ValueError:
+        await message.answer(
+            "❌ Reminder ID raqam bo'lishi kerak."
+        )
+        return
+
+    success = await cancel_reminder_by_id(
+        reminder_id=reminder_id,
+        owner_telegram_id=message.from_user.id,
+    )
+
+    if success:
+        await message.answer(
+            f"❌ <b>#{reminder_id}</b> reminder bekor qilindi.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"❌ <b>#{reminder_id}</b> reminder topilmadi "
+            "yoki u senga tegishli emas.",
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# ADMIN STATUS
+# ============================================================
+
+
+@router.message(Command("admin"))
+async def command_admin(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    if message.chat.type in {"group", "supergroup"}:
+        allowed = await is_group_admin(message)
+
+        if allowed:
+            await message.answer(
+                "🔐 <b>Admin access: YES</b>\n\n"
+                "Siz ushbu guruhni boshqarishingiz mumkin.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "🔐 <b>Admin access: NO</b>",
+                parse_mode="HTML",
+            )
+
+        return
+
+    allowed = permission_service.is_admin(
+        message.from_user.id
+    )
+
+    if allowed:
+        await message.answer(
+            "👑 <b>SARA global admin: YES</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            "🔐 <b>SARA global admin: NO</b>",
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# MEMORY COMMAND ERROR HANDLER
+# ============================================================
+
+
+@router.message(Command("memory_clear"))
+async def command_memory_clear_alias(message: Message) -> None:
+    """
+    /memory_clear
+    eski konfiguratsiyadagi command uchun xavfsiz alias.
+
+    Asl o'chirish:
+        /forget_all CONFIRM
+    """
+
+    if message.from_user is None:
+        return
+
+    args = split_args(message)
+
+    if not args or args[0].upper() != "CONFIRM":
+        count = await memory_manager.user_memory_count(
+            user_telegram_id=message.from_user.id
+        )
+
+        await message.answer(
+            "⚠️ <b>Shaxsiy memorylarni tozalash</b>\n\n"
+            f"Senda <b>{count}</b> ta memory mavjud.\n\n"
+            "Tasdiqlash uchun:\n"
+            "<code>/memory_clear CONFIRM</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    deleted = await memory_manager.clear_user_memories(
+        user_telegram_id=message.from_user.id
+    )
+
+    await message.answer(
+        "🗑 <b>Shaxsiy memorylar tozalandi.</b>\n\n"
+        f"O'chirilgan: <b>{deleted}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# UNKNOWN / COMMAND LOGGING
+# ============================================================
+
+
+@router.message(Command("sara_status"))
+async def command_sara_status(message: Message) -> None:
+    """
+    SARA tizimlarining umumiy holati.
+    """
+
+    await message.answer(
+        "🤖 <b>SARA AI STATUS</b>\n\n"
+        f"🧠 Memory: "
+        f"<b>{'ON' if settings.memory_enabled else 'OFF'}</b>\n"
+        f"👥 Proactive groups: "
+        f"<b>{'ON' if settings.proactive_group_mode else 'OFF'}</b>\n"
+        f"⏰ Reminders: "
+        f"<b>{'ON' if settings.reminder_enabled else 'OFF'}</b>\n"
+        f"🤖 Bot-to-bot: "
+        f"<b>{'ON' if settings.bot_to_bot_mode else 'OFF'}</b>\n"
+        f"🖼 Media: "
+        f"<b>{'ON' if settings.media_enabled else 'OFF'}</b>",
+        parse_mode="HTML",
+    )
