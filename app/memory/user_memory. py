@@ -1,0 +1,45 @@
+from app.memory.manager import memory_manager
+
+
+async def remember_user(
+    user_id: int,
+    text: str,
+    memory_type: str = "IMPORTANT_FACT",
+    importance: int = 50,
+    confidence: float = 1.0,
+):
+    return await memory_manager.save_user_memory(
+        user_telegram_id=user_id,
+        content=text,
+        memory_type=memory_type,
+        importance=importance,
+        confidence=confidence,
+    )
+
+
+async def get_user_memory(
+    user_id: int,
+    limit: int = 15,
+):
+    return await memory_manager.get_user_memories(
+        user_telegram_id=user_id,
+        limit=limit,
+    )
+
+
+async def forget_user(
+    user_id: int,
+    memory_id: int,
+):
+    return await memory_manager.forget_user_memory(
+        user_telegram_id=user_id,
+        memory_id=memory_id,
+    )
+
+
+async def clear_user_memory(
+    user_id: int,
+):
+    return await memory_manager.clear_user_memories(
+        user_telegram_id=user_id,
+    )
