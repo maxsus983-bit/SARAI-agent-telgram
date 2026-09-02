@@ -11,13 +11,14 @@ from app.agent.planner import (
     PlanStep,
     PlanStepType,
 )
+from app.agent.tool_registry import (
+    ToolRegistry,
+    ToolResult,
+    tool_registry,
+)
 
 logger = logging.getLogger("sara.agent.executor")
 
-
-# ============================================================
-# TYPES
-# ============================================================
 
 StepHandler = Callable[
     [ExecutionPlan, PlanStep],
@@ -25,37 +26,28 @@ StepHandler = Callable[
 ]
 
 
-# ============================================================
-# EXECUTION RESULT
-# ============================================================
-
 @dataclass
 class ExecutionResult:
-
     success: bool
-
     plan_id: str
-
     action: ActionType
-
     completed_steps: int
-
     total_steps: int
 
     result: Any = None
-
     error: str | None = None
 
     duration_seconds: float = 0.0
 
 
-# ============================================================
-# EXECUTOR
-# ============================================================
-
 class SaraExecutor:
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry | None = None,
+    ) -> None:
+
+        self.registry = registry or tool_registry
 
         self._handlers: dict[
             PlanStepType,
@@ -63,26 +55,20 @@ class SaraExecutor:
         ] = {}
 
         self.total_executions = 0
-
         self.successful_executions = 0
-
         self.failed_executions = 0
 
         self.total_steps = 0
-
         self.successful_steps = 0
-
         self.failed_steps = 0
 
         self._register_default_handlers()
 
-    # ========================================================
+    # =========================================================
     # HANDLERS
-    # ========================================================
+    # =========================================================
 
-    def _register_default_handlers(
-        self,
-    ) -> None:
+    def _register_default_handlers(self) -> None:
 
         self.register_handler(
             PlanStepType.ANALYZE,
@@ -144,42 +130,17 @@ class SaraExecutor:
             self._handle_finish,
         )
 
-    # ========================================================
-    # REGISTER HANDLER
-    # ========================================================
-
     def register_handler(
         self,
         step_type: PlanStepType,
         handler: StepHandler,
     ) -> None:
 
-        self._handlers[
-            step_type
-        ] = handler
+        self._handlers[step_type] = handler
 
-        logger.debug(
-            "Executor handler registered | step=%s",
-            step_type.value,
-        )
-
-    # ========================================================
-    # CHECK HANDLER
-    # ========================================================
-
-    def has_handler(
-        self,
-        step_type: PlanStepType,
-    ) -> bool:
-
-        return (
-            step_type
-            in self._handlers
-        )
-
-    # ========================================================
+    # =========================================================
     # EXECUTE PLAN
-    # ========================================================
+    # =========================================================
 
     async def execute(
         self,
@@ -198,36 +159,20 @@ class SaraExecutor:
 
         if plan.cancelled:
 
-            return ExecutionResult(
+            return self._result(
+                plan=plan,
                 success=False,
-                plan_id=plan.plan_id,
-                action=plan.action,
-                completed_steps=0,
-                total_steps=len(plan.steps),
                 error="plan_cancelled",
-                duration_seconds=(
-                    time.monotonic()
-                    - started
-                ),
+                started=started,
             )
 
         if plan.completed:
 
-            return ExecutionResult(
+            return self._result(
+                plan=plan,
                 success=True,
-                plan_id=plan.plan_id,
-                action=plan.action,
-                completed_steps=len(
-                    plan.steps
-                ),
-                total_steps=len(
-                    plan.steps
-                ),
                 result="already_completed",
-                duration_seconds=(
-                    time.monotonic()
-                    - started
-                ),
+                started=started,
             )
 
         last_result: Any = None
@@ -237,7 +182,6 @@ class SaraExecutor:
             while not plan.completed:
 
                 if plan.cancelled:
-
                     raise RuntimeError(
                         "Plan cancelled during execution."
                     )
@@ -245,7 +189,6 @@ class SaraExecutor:
                 step = plan.get_current_step()
 
                 if step is None:
-
                     break
 
                 self.total_steps += 1
@@ -262,14 +205,6 @@ class SaraExecutor:
                         "No executor handler for "
                         f"{step.step_type.value}"
                     )
-
-                logger.debug(
-                    "Executing step | plan=%s | "
-                    "step=%s | type=%s",
-                    plan.plan_id,
-                    step.id,
-                    step.step_type.value,
-                )
 
                 try:
 
@@ -291,8 +226,7 @@ class SaraExecutor:
                     self.failed_steps += 1
 
                     logger.exception(
-                        "Plan step failed | "
-                        "plan=%s | step=%s",
+                        "Plan step failed | plan=%s | step=%s",
                         plan.plan_id,
                         step.id,
                     )
@@ -301,14 +235,13 @@ class SaraExecutor:
 
                         plan.cancel(
                             reason=(
-                                f"Step {step.id} "
-                                f"failed: {exc}"
+                                f"Step {step.id} failed: "
+                                f"{exc}"
                             )
                         )
 
                         raise
 
-                    # Optional step.
                     plan.complete_current_step(
                         {
                             "success": False,
@@ -316,61 +249,40 @@ class SaraExecutor:
                         }
                     )
 
-            self.successful_executions += 1
+            success = plan.completed
 
-            duration = (
-                time.monotonic()
-                - started
-            )
+            if success:
+                self.successful_executions += 1
+            else:
+                self.failed_executions += 1
 
-            return ExecutionResult(
-                success=plan.completed,
-                plan_id=plan.plan_id,
-                action=plan.action,
-                completed_steps=sum(
-                    1
-                    for step in plan.steps
-                    if step.completed
-                ),
-                total_steps=len(
-                    plan.steps
-                ),
+            return self._result(
+                plan=plan,
+                success=success,
                 result=last_result,
-                error=None
-                if plan.completed
-                else "plan_not_completed",
-                duration_seconds=duration,
+                error=(
+                    None
+                    if success
+                    else "plan_not_completed"
+                ),
+                started=started,
             )
 
         except Exception as exc:
 
             self.failed_executions += 1
 
-            duration = (
-                time.monotonic()
-                - started
-            )
-
-            return ExecutionResult(
+            return self._result(
+                plan=plan,
                 success=False,
-                plan_id=plan.plan_id,
-                action=plan.action,
-                completed_steps=sum(
-                    1
-                    for step in plan.steps
-                    if step.completed
-                ),
-                total_steps=len(
-                    plan.steps
-                ),
                 result=last_result,
                 error=str(exc),
-                duration_seconds=duration,
+                started=started,
             )
 
-    # ========================================================
-    # DEFAULT HANDLERS
-    # ========================================================
+    # =========================================================
+    # STEP HANDLERS
+    # =========================================================
 
     async def _handle_analyze(
         self,
@@ -381,10 +293,8 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "analysis",
-            "plan_id": plan.plan_id,
+            "text": plan.user_text,
         }
-
-    # ========================================================
 
     async def _handle_retrieve_memory(
         self,
@@ -395,10 +305,8 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "user_memory",
-            "status": "delegated_to_context_system",
+            "status": "available_through_ai_context",
         }
-
-    # ========================================================
 
     async def _handle_retrieve_group_memory(
         self,
@@ -409,10 +317,8 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "group_memory",
-            "status": "delegated_to_context_system",
+            "status": "available_through_ai_context",
         }
-
-    # ========================================================
 
     async def _handle_relationship(
         self,
@@ -423,10 +329,8 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "relationship",
-            "status": "delegated_to_agent_context",
+            "status": "available_through_agent_context",
         }
-
-    # ========================================================
 
     async def _handle_session_state(
         self,
@@ -437,10 +341,8 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "session_state",
-            "status": "delegated_to_agent_context",
+            "status": "available_through_agent_context",
         }
-
-    # ========================================================
 
     async def _handle_generate_response(
         self,
@@ -448,13 +350,16 @@ class SaraExecutor:
         step: PlanStep,
     ) -> dict[str, Any]:
 
+        response_text = (
+            step.arguments.get("response_text")
+            or plan.metadata.get("response_text")
+        )
+
         return {
             "success": True,
             "type": "generate_response",
-            "status": "waiting_for_ai_engine",
+            "text": response_text,
         }
-
-    # ========================================================
 
     async def _handle_clarification(
         self,
@@ -465,10 +370,7 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "clarification",
-            "status": "waiting_for_ai_engine",
         }
-
-    # ========================================================
 
     async def _handle_save_memory(
         self,
@@ -479,10 +381,9 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "save_memory",
-            "status": "delegated_to_memory_system",
+            "status": "memory_service_integration_pending",
+            "text": step.arguments.get("text"),
         }
-
-    # ========================================================
 
     async def _handle_create_reminder(
         self,
@@ -493,24 +394,62 @@ class SaraExecutor:
         return {
             "success": True,
             "type": "create_reminder",
-            "status": "waiting_for_reminder_service",
+            "status": "reminder_service_integration_pending",
+            "text": step.arguments.get("text"),
         }
 
-    # ========================================================
+    # =========================================================
+    # REAL TOOL EXECUTION
+    # =========================================================
 
     async def _handle_use_tool(
         self,
         plan: ExecutionPlan,
         step: PlanStep,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
 
-        return {
-            "success": True,
-            "type": "tool",
-            "status": "waiting_for_tool_registry",
-        }
+        tool_name = step.arguments.get(
+            "tool_name"
+        )
 
-    # ========================================================
+        tool_arguments = step.arguments.get(
+            "tool_arguments",
+            {},
+        )
+
+        if not tool_name:
+
+            return ToolResult(
+                success=False,
+                tool_name="",
+                error="tool_name_missing",
+            )
+
+        logger.info(
+            "Executor calling ToolRegistry | "
+            "tool=%s | plan=%s",
+            tool_name,
+            plan.plan_id,
+        )
+
+        result = await self.registry.execute(
+            tool_name,
+            arguments=tool_arguments,
+        )
+
+        if not result.success:
+
+            logger.warning(
+                "Tool failed | tool=%s | error=%s",
+                tool_name,
+                result.error,
+            )
+
+        return result
+
+    # =========================================================
+    # REAL TELEGRAM SEND
+    # =========================================================
 
     async def _handle_send_response(
         self,
@@ -518,13 +457,46 @@ class SaraExecutor:
         step: PlanStep,
     ) -> dict[str, Any]:
 
-        return {
-            "success": True,
-            "type": "send_response",
-            "status": "waiting_for_telegram_sender",
-        }
+        chat_id = step.arguments.get(
+            "chat_id"
+        )
 
-    # ========================================================
+        text = (
+            step.arguments.get("text")
+            or plan.metadata.get("response_text")
+        )
+
+        reply_to_message_id = step.arguments.get(
+            "reply_to_message_id"
+        )
+
+        if not chat_id:
+            return {
+                "success": False,
+                "error": "chat_id_missing",
+            }
+
+        if not text:
+            return {
+                "success": False,
+                "error": "response_text_missing",
+            }
+
+        result = await self.registry.execute(
+            "telegram_send_message",
+            arguments={
+                "chat_id": chat_id,
+                "text": text,
+                "reply_to_message_id": reply_to_message_id,
+            },
+        )
+
+        return {
+            "success": result.success,
+            "type": "telegram_send_message",
+            "result": result.result,
+            "error": result.error,
+        }
 
     async def _handle_finish(
         self,
@@ -538,9 +510,9 @@ class SaraExecutor:
             "plan_id": plan.plan_id,
         }
 
-    # ========================================================
-    # SINGLE STEP
-    # ========================================================
+    # =========================================================
+    # EXECUTE SINGLE STEP
+    # =========================================================
 
     async def execute_step(
         self,
@@ -550,7 +522,6 @@ class SaraExecutor:
         step = plan.get_current_step()
 
         if step is None:
-
             return None
 
         handler = self._handlers.get(
@@ -558,7 +529,6 @@ class SaraExecutor:
         )
 
         if handler is None:
-
             raise RuntimeError(
                 "No handler registered for "
                 f"{step.step_type.value}"
@@ -578,39 +548,54 @@ class SaraExecutor:
 
         return result
 
-    # ========================================================
+    # =========================================================
+    # RESULT
+    # =========================================================
+
+    def _result(
+        self,
+        *,
+        plan: ExecutionPlan,
+        success: bool,
+        started: float,
+        result: Any = None,
+        error: str | None = None,
+    ) -> ExecutionResult:
+
+        return ExecutionResult(
+            success=success,
+            plan_id=plan.plan_id,
+            action=plan.action,
+            completed_steps=sum(
+                1
+                for step in plan.steps
+                if step.completed
+            ),
+            total_steps=len(plan.steps),
+            result=result,
+            error=error,
+            duration_seconds=(
+                time.monotonic() - started
+            ),
+        )
+
+    # =========================================================
     # STATS
-    # ========================================================
+    # =========================================================
 
     def stats(self) -> dict[str, int]:
 
         return {
-            "total_executions": (
-                self.total_executions
-            ),
-            "successful_executions": (
-                self.successful_executions
-            ),
-            "failed_executions": (
-                self.failed_executions
-            ),
-            "total_steps": (
-                self.total_steps
-            ),
-            "successful_steps": (
-                self.successful_steps
-            ),
-            "failed_steps": (
-                self.failed_steps
-            ),
+            "total_executions": self.total_executions,
+            "successful_executions": self.successful_executions,
+            "failed_executions": self.failed_executions,
+            "total_steps": self.total_steps,
+            "successful_steps": self.successful_steps,
+            "failed_steps": self.failed_steps,
             "registered_handlers": len(
                 self._handlers
             ),
         }
 
-
-# ============================================================
-# GLOBAL EXECUTOR
-# ============================================================
 
 sara_executor = SaraExecutor()
