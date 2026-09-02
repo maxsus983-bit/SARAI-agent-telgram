@@ -6,6 +6,11 @@ import sys
 
 from aiogram import Bot, Dispatcher
 
+from app.agent.tools.telegram_tool import (
+    configure_telegram_tool,
+    send_telegram_message,
+)
+from app.agent.tool_registry import tool_registry
 from app.bot.router import create_router
 from app.config.settings import settings
 from app.database.init import init_database
@@ -28,15 +33,41 @@ logging.basicConfig(
     ),
 )
 
-
 logger = logging.getLogger("sara")
 
 
-async def main() -> None:
+def register_tools(bot: Bot) -> None:
+    """
+    SARA ishlatishi mumkin bo'lgan real tool'larni ulaydi.
+    """
 
-    # ============================================================
-    # CONFIG CHECK
-    # ============================================================
+    configure_telegram_tool(bot)
+
+    if not tool_registry.exists(
+        "telegram_send_message"
+    ):
+        tool_registry.register(
+            name="telegram_send_message",
+            description=(
+                "Telegram chat yoki guruhga xabar yuboradi. "
+                "SARA mustaqil ravishda suhbatga aralashishi "
+                "yoki foydalanuvchiga javob yuborishi mumkin."
+            ),
+            handler=send_telegram_message,
+            enabled=True,
+            dangerous=False,
+            timeout=30,
+        )
+
+    logger.info(
+        "Registered tools: %s",
+        tool_registry.list_tools(
+            enabled_only=True
+        ),
+    )
+
+
+async def main() -> None:
 
     if not settings.bot_token:
         raise RuntimeError(
@@ -53,33 +84,21 @@ async def main() -> None:
             "OPENROUTER_MODEL .env ichida sozlanmagan."
         )
 
-    logger.info(
-        "=========================================="
-    )
-    logger.info(
-        "          SARA AI STARTING"
-    )
-    logger.info(
-        "=========================================="
-    )
+    logger.info("==========================================")
+    logger.info("          SARA AI STARTING")
+    logger.info("==========================================")
 
-    # ============================================================
+    # =========================================================
     # DATABASE
-    # ============================================================
-
-    logger.info(
-        "Database ishga tushirilmoqda..."
-    )
+    # =========================================================
 
     await init_database()
 
-    logger.info(
-        "Database tayyor."
-    )
+    logger.info("Database tayyor.")
 
-    # ============================================================
-    # BOT
-    # ============================================================
+    # =========================================================
+    # TELEGRAM
+    # =========================================================
 
     bot = Bot(
         token=settings.bot_token
@@ -91,17 +110,22 @@ async def main() -> None:
         create_router()
     )
 
-    # ============================================================
-    # SCHEDULER BOT BILAN BOG'LANADI
-    # ============================================================
+    # =========================================================
+    # TOOLS
+    # =========================================================
 
-    scheduler_manager.set_bot(
-        bot
+    register_tools(bot)
+
+    logger.info(
+        "SARA Tool Registry: %s",
+        tool_registry.stats(),
     )
 
-    # ============================================================
-    # START
-    # ============================================================
+    # =========================================================
+    # SCHEDULER
+    # =========================================================
+
+    scheduler_manager.set_bot(bot)
 
     try:
 
@@ -112,17 +136,9 @@ async def main() -> None:
             me.username,
         )
 
-        # --------------------------------------------------------
-        # Webhookni tozalash
-        # --------------------------------------------------------
-
         await bot.delete_webhook(
             drop_pending_updates=True
         )
-
-        # --------------------------------------------------------
-        # Scheduler start
-        # --------------------------------------------------------
 
         if settings.reminder_enabled:
 
@@ -131,10 +147,6 @@ async def main() -> None:
             logger.info(
                 "Reminder Scheduler ishga tushdi."
             )
-
-            # ----------------------------------------------------
-            # Restartdan keyingi recovery
-            # ----------------------------------------------------
 
             restored = await restore_reminders()
 
@@ -146,12 +158,8 @@ async def main() -> None:
         else:
 
             logger.info(
-                "Reminder system .env orqali o'chirilgan."
+                "Reminder system o'chirilgan."
             )
-
-        # --------------------------------------------------------
-        # POLLING
-        # --------------------------------------------------------
 
         logger.info(
             "SARA AI ishga tushdi."
@@ -167,10 +175,6 @@ async def main() -> None:
             "SARA AI to'xtatilmoqda..."
         )
 
-        # --------------------------------------------------------
-        # Scheduler stop
-        # --------------------------------------------------------
-
         try:
             await scheduler_manager.stop()
         except Exception:
@@ -178,20 +182,12 @@ async def main() -> None:
                 "Scheduler stop xatosi."
             )
 
-        # --------------------------------------------------------
-        # Bot close
-        # --------------------------------------------------------
-
         try:
             await bot.session.close()
         except Exception:
             logger.exception(
                 "Telegram session close xatosi."
             )
-
-        # --------------------------------------------------------
-        # Database close
-        # --------------------------------------------------------
 
         try:
             await close_database()
@@ -208,10 +204,7 @@ async def main() -> None:
 if __name__ == "__main__":
 
     try:
-
-        asyncio.run(
-            main()
-        )
+        asyncio.run(main())
 
     except KeyboardInterrupt:
 
