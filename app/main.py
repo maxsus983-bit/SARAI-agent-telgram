@@ -2,182 +2,138 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
-from pathlib import Path
 
-from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
 
-
-# ============================================================
-# SARA AI
-# Main Application
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-load_dotenv(BASE_DIR / ".env")
+from app.bot.router import create_router
+from app.config.settings import settings
+from app.database.init import init_database
+from app.database.session import close_database
 
 
-def setup_logging() -> None:
-    """
-    Configure SARA logging.
-    """
-
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-
-    level = getattr(
+logging.basicConfig(
+    level=getattr(
         logging,
-        level_name,
+        settings.log_level.upper(),
         logging.INFO,
-    )
-
-    logging.basicConfig(
-        level=level,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(name)s | "
-            "%(message)s"
-        ),
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-    )
-
-    # Reduce noisy third-party logs.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("aiogram").setLevel(logging.INFO)
-    logging.getLogger("sqlalchemy.engine").setLevel(
-        logging.WARNING
-    )
-
+    ),
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
 
 logger = logging.getLogger("sara")
 
 
-def validate_environment() -> None:
-    """
-    Validate mandatory environment variables.
-    """
+async def main() -> None:
 
-    required = [
-        "BOT_TOKEN",
-        "OPENROUTER_API_KEY",
-        "OPENROUTER_MODEL",
-    ]
-
-    missing = []
-
-    for variable in required:
-        value = os.getenv(variable, "").strip()
-
-        if not value:
-            missing.append(variable)
-
-    if missing:
+    if not settings.bot_token:
         raise RuntimeError(
-            "Missing required environment variables: "
-            + ", ".join(missing)
+            "BOT_TOKEN .env ichida sozlanmagan."
         )
 
+    if not settings.openrouter_api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY .env ichida sozlanmagan."
+        )
 
-def print_startup_banner() -> None:
-    """
-    Display SARA startup information.
-    """
+    if not settings.openrouter_model:
+        raise RuntimeError(
+            "OPENROUTER_MODEL .env ichida sozlanmagan."
+        )
 
-    memory = os.getenv(
-        "MEMORY_ENABLED",
-        "true",
+    logger.info(
+        "=========================================="
     )
 
-    proactive = os.getenv(
-        "PROACTIVE_GROUP_MODE",
-        "true",
+    logger.info(
+        "        SARA AI STARTING"
     )
 
-    reminders = os.getenv(
-        "REMINDER_ENABLED",
-        "true",
+    logger.info(
+        "=========================================="
     )
 
-    bot_to_bot = os.getenv(
-        "BOT_TO_BOT_MODE",
-        "true",
+    # ----------------------------------------------------------
+    # DATABASE
+    # ----------------------------------------------------------
+
+    logger.info(
+        "Database ishga tushirilmoqda..."
     )
 
-    print()
-    print("=" * 60)
-    print("                    SARA AI")
-    print("              TELEGRAM AI AGENT")
-    print("=" * 60)
-    print(
-        f"Memory          : "
-        f"{'ON' if memory.lower() == 'true' else 'OFF'}"
+    await init_database()
+
+    logger.info(
+        "Database tayyor."
     )
-    print(
-        f"Proactive Mode  : "
-        f"{'ON' if proactive.lower() == 'true' else 'OFF'}"
+
+    # ----------------------------------------------------------
+    # BOT
+    # ----------------------------------------------------------
+
+    bot = Bot(
+        token=settings.bot_token
     )
-    print(
-        f"Reminders       : "
-        f"{'ON' if reminders.lower() == 'true' else 'OFF'}"
+
+    dispatcher = Dispatcher()
+
+    dispatcher.include_router(
+        create_router()
     )
-    print(
-        f"Bot-to-Bot      : "
-        f"{'ON' if bot_to_bot.lower() == 'true' else 'OFF'}"
-    )
-    print("=" * 60)
-    print()
-
-
-async def main() -> None:
-    """
-    SARA application entry point.
-
-    More services will be connected here:
-        - Database
-        - Telegram Bot
-        - OpenRouter
-        - Memory Engine
-        - Scheduler
-        - Agent Engine
-    """
-
-    setup_logging()
-
-    logger.info("Starting SARA AI...")
-
-    validate_environment()
-
-    print_startup_banner()
-
-    logger.info("Environment: READY")
-    logger.info("SARA core: READY")
-
-    # Temporary event loop until the real Telegram
-    # application is connected.
-    stop_event = asyncio.Event()
 
     try:
-        await stop_event.wait()
 
-    except asyncio.CancelledError:
-        logger.info("Shutdown signal received.")
+        me = await bot.get_me()
 
-        raise
+        logger.info(
+            "Telegram bot: @%s",
+            me.username,
+        )
+
+        logger.info(
+            "SARA AI ishga tushdi."
+        )
+
+        # Eski pending update'larni tashlab yuborish.
+        await bot.delete_webhook(
+            drop_pending_updates=True
+        )
+
+        await dispatcher.start_polling(
+            bot
+        )
 
     finally:
-        logger.info("SARA AI stopped.")
+
+        logger.info(
+            "SARA AI to'xtatilmoqda..."
+        )
+
+        await bot.session.close()
+
+        await close_database()
 
 
 if __name__ == "__main__":
+
     try:
         asyncio.run(main())
 
     except KeyboardInterrupt:
-        logger.info("SARA stopped by user.")
+
+        logger.info(
+            "SARA AI to'xtatildi."
+        )
 
     except Exception:
-        logger.exception("Fatal SARA error.")
+
+        logger.exception(
+            "SARA AI critical error."
+        )
+
         sys.exit(1)
