@@ -1,13 +1,8 @@
+
 """
 SARA AI Scheduler Package.
 
-Bu package quyidagi vazifalarni boshqaradi:
-
-- Reminder yaratish
-- Reminderlarni vaqtida ishga tushirish
-- Bot restart bo'lganda reminderlarni tiklash
-- Persistent reminder storage
-- Scheduler lifecycle
+Reminder va scheduled task tizimi.
 """
 
 from app.scheduler.manager import scheduler_manager
