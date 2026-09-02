@@ -5,36 +5,29 @@ import logging
 from aiogram import Router
 from aiogram.types import Message
 
+from app.agent.runtime import agent_runtime
 from app.ai.engine import ai_engine
 from app.bot.sender import send_answer
 from app.services.message_service import message_service
 from app.services.user_service import user_service
-
 
 logger = logging.getLogger("sara.bot.private")
 
 router = Router(name="private_messages")
 
 
-@router.message(lambda message: message.chat.type == "private")
+@router.message(
+    lambda message: (
+        message.chat.type == "private"
+        and bool(message.from_user)
+        and bool(message.text)
+    )
+)
 async def handle_private_message(message: Message) -> None:
-    """
-    SARA AI — Private Chat Handler
 
-    Vazifalari:
-    - Foydalanuvchini DB ga saqlash/yangilash
-    - Xabarni DB ga saqlash
-    - AI ga yuborish
-    - AI javobini DB ga saqlash
-    - Telegramga javob yuborish
-    """
-
-    # Faqat haqiqiy foydalanuvchi xabarlarini qayta ishlaymiz
     if message.from_user is None:
         return
 
-    # Hozircha text xabarlar bilan ishlaymiz.
-    # Media keyingi bosqichda alohida handler orqali ishlanadi.
     if not message.text:
         return
 
@@ -42,15 +35,18 @@ async def handle_private_message(message: Message) -> None:
     chat_id = message.chat.id
 
     try:
-        # =========================================================
-        # 1. USERNI DATABASE GA SAQLASH
-        # =========================================================
 
-        db_user = await user_service.get_or_create(user)
+        # ====================================================
+        # USER
+        # ====================================================
 
-        # =========================================================
-        # 2. USER XABARINI DATABASE GA SAQLASH
-        # =========================================================
+        db_user = await user_service.get_or_create(
+            user
+        )
+
+        # ====================================================
+        # SAVE USER MESSAGE
+        # ====================================================
 
         saved_message = await message_service.save(
             telegram_message_id=message.message_id,
@@ -67,9 +63,47 @@ async def handle_private_message(message: Message) -> None:
             is_bot_message=False,
         )
 
-        # =========================================================
-        # 3. AI GA XABAR YUBORISH
-        # =========================================================
+        # ====================================================
+        # AGENT RUNTIME
+        # ====================================================
+
+        is_question = (
+            "?" in message.text
+            or message.text.lower().startswith(
+                (
+                    "nima",
+                    "nega",
+                    "qanday",
+                    "qachon",
+                    "qayer",
+                    "kim",
+                    "what",
+                    "why",
+                    "how",
+                    "when",
+                    "where",
+                    "who",
+                )
+            )
+        )
+
+        agent_context = await agent_runtime.prepare(
+            message=message,
+            user_id=db_user.telegram_id,
+            group_id=None,
+            sara_called=True,
+            is_question=is_question,
+            is_reply_to_sara=False,
+        )
+
+        logger.debug(
+            "Private Agent Runtime: %s",
+            agent_context,
+        )
+
+        # ====================================================
+        # AI
+        # ====================================================
 
         answer = await ai_engine.generate(
             user_text=message.text,
@@ -79,9 +113,30 @@ async def handle_private_message(message: Message) -> None:
             source_message_id=saved_message.id,
         )
 
-        # =========================================================
-        # 4. AI JAVOBINI DATABASE GA SAQLASH
-        # =========================================================
+        if not answer or not answer.strip():
+            answer = (
+                "Hozircha javob yaratilmadi. "
+                "Yana bir marta urinib ko'r."
+            )
+
+        # ====================================================
+        # AGENT RESPONSE STATE
+        # ====================================================
+
+        from app.agent.loop_guard import loop_guard
+        from app.agent.proactive import proactive_agent
+
+        loop_guard.register_response(
+            chat_id=chat_id
+        )
+
+        proactive_agent.record_response(
+            chat_id=chat_id
+        )
+
+        # ====================================================
+        # SAVE ASSISTANT MESSAGE
+        # ====================================================
 
         await message_service.save(
             telegram_message_id=None,
@@ -94,9 +149,9 @@ async def handle_private_message(message: Message) -> None:
             is_bot_message=True,
         )
 
-        # =========================================================
-        # 5. TELEGRAMGA JAVOB YUBORISH
-        # =========================================================
+        # ====================================================
+        # SEND
+        # ====================================================
 
         await send_answer(
             bot=message.bot,
@@ -106,23 +161,29 @@ async def handle_private_message(message: Message) -> None:
         )
 
         logger.info(
-            "Private message processed | user=%s | chat=%s",
+            "Private AI response sent | user=%s | chat=%s",
             user.id,
             chat_id,
         )
 
     except Exception:
+
         logger.exception(
-            "Private message processing failed | user=%s | chat=%s",
+            "Private message processing failed | "
+            "user=%s | chat=%s",
             user.id,
             chat_id,
         )
 
-        # Foydalanuvchiga ichki xatoni ko'rsatmaymiz.
         try:
+
             await message.answer(
-                "Hozircha xabarni qayta ishlashda muammo yuz berdi. "
-                "Birozdan keyin yana urinib ko‘r."
+                "Hozir xabarni qayta ishlashda muammo yuz berdi. "
+                "Birozdan keyin yana urinib ko'r."
             )
+
         except Exception:
-            logger.exception("Failed to send private error message.")
+
+            logger.exception(
+                "Private error message failed."
+        )
