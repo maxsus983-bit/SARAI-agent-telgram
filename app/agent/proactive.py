@@ -1,177 +1,213 @@
 from __future__ import annotations
 
+import logging
 import random
 import time
 from dataclasses import dataclass
 
 from app.config.settings import settings
 
+logger = logging.getLogger("sara.agent.proactive")
+
+
+# ============================================================
+# PROACTIVE DECISION
+# ============================================================
 
 @dataclass
 class ProactiveDecision:
     should_respond: bool
     reason: str
+    confidence: float = 0.0
 
+
+# ============================================================
+# GROUP STATE
+# ============================================================
+
+@dataclass
+class GroupActivity:
+    last_activity: float = 0.0
+    last_response: float = 0.0
+    message_count: int = 0
+    response_count: int = 0
+
+
+# ============================================================
+# PROACTIVE AGENT
+# ============================================================
 
 class ProactiveAgent:
-    """
-    SARA guruhlarda proactive javoblarini boshqaradi.
-
-    Maqsad:
-    - Har bir xabarga javob bermaslik
-    - Cooldown saqlash
-    - Quiet group rejimini hurmat qilish
-    - Savollarga javob berish ehtimolini oshirish
-    - SARA chaqirilganda doim javob berish
-    - SARA'ning o'zi ketma-ket xabar yuborib spam qilmasligi
-    """
 
     def __init__(self) -> None:
-        self._last_activity: dict[int, float] = {}
-        self._last_response: dict[int, float] = {}
 
-    # =========================================================
+        self._groups: dict[int, GroupActivity] = {}
+
+        # Proactive javob ehtimollari.
+        self.question_probability = 0.35
+        self.random_probability = 0.04
+
+        # Juda tez-tez gapirmasligi uchun.
+        self.minimum_cooldown = max(
+            1,
+            settings.proactive_cooldown_seconds,
+        )
+
+        # Quiet mode'da qancha vaqt o'tgach
+        # yana tabiiy ravishda gapirish mumkin.
+        self.quiet_interval = max(
+            1,
+            settings.quiet_group_interval_seconds,
+        )
+
+    # ========================================================
+    # INTERNAL
+    # ========================================================
+
+    def _get_state(
+        self,
+        chat_id: int,
+    ) -> GroupActivity:
+
+        state = self._groups.get(chat_id)
+
+        if state is None:
+
+            state = GroupActivity()
+
+            self._groups[chat_id] = state
+
+        return state
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    # ========================================================
     # ACTIVITY
-    # =========================================================
+    # ========================================================
 
     def record_activity(
         self,
         *,
         chat_id: int,
     ) -> None:
-        self._last_activity[chat_id] = (
-            time.monotonic()
-        )
 
-    # =========================================================
+        state = self._get_state(chat_id)
+
+        state.last_activity = self._now()
+        state.message_count += 1
+
+    # ========================================================
     # RESPONSE
-    # =========================================================
+    # ========================================================
 
     def record_response(
         self,
         *,
         chat_id: int,
     ) -> None:
-        self._last_response[chat_id] = (
-            time.monotonic()
-        )
 
-    # =========================================================
+        state = self._get_state(chat_id)
+
+        state.last_response = self._now()
+        state.response_count += 1
+
+    # ========================================================
     # COOLDOWN
-    # =========================================================
+    # ========================================================
 
-    def cooldown_passed(
+    def cooldown_remaining(
+        self,
+        *,
+        chat_id: int,
+    ) -> float:
+
+        state = self._get_state(chat_id)
+
+        if state.last_response <= 0:
+            return 0.0
+
+        elapsed = (
+            self._now()
+            - state.last_response
+        )
+
+        remaining = (
+            self.minimum_cooldown
+            - elapsed
+        )
+
+        return max(
+            0.0,
+            remaining,
+        )
+
+    def cooldown_ready(
         self,
         *,
         chat_id: int,
     ) -> bool:
 
-        last_response = self._last_response.get(
-            chat_id
+        return (
+            self.cooldown_remaining(
+                chat_id=chat_id
+            )
+            <= 0
         )
 
-        if last_response is None:
+    # ========================================================
+    # QUIET INTERVAL
+    # ========================================================
+
+    def quiet_interval_passed(
+        self,
+        *,
+        chat_id: int,
+    ) -> bool:
+
+        state = self._get_state(chat_id)
+
+        if state.last_response <= 0:
             return True
 
         elapsed = (
-            time.monotonic()
-            - last_response
+            self._now()
+            - state.last_response
         )
 
-        return (
-            elapsed
-            >= settings.proactive_cooldown_seconds
-        )
+        return elapsed >= self.quiet_interval
 
-    # =========================================================
-    # QUIET CHECK
-    # =========================================================
-
-    def should_stay_quiet(
-        self,
-        *,
-        chat_id: int,
-    ) -> bool:
-
-        last_response = self._last_response.get(
-            chat_id
-        )
-
-        if last_response is None:
-            return False
-
-        elapsed = (
-            time.monotonic()
-            - last_response
-        )
-
-        return (
-            elapsed
-            < settings.quiet_group_interval_seconds
-        )
-
-    # =========================================================
+    # ========================================================
     # QUESTION DETECTION
-    # =========================================================
+    # ========================================================
 
-    @staticmethod
-    def looks_like_question(
-        text: str,
-    ) -> bool:
+    def question_score(
+        self,
+        *,
+        message_is_question: bool,
+        sara_called: bool,
+        message_is_reply_to_sara: bool,
+    ) -> float:
 
-        if not text:
-            return False
+        score = 0.0
 
-        text = text.strip()
+        if message_is_question:
+            score += 0.45
 
-        if "?" in text:
-            return True
+        if sara_called:
+            score += 0.40
 
-        question_words = (
-            "nima",
-            "nega",
-            "qanday",
-            "qachon",
-            "qayer",
-            "qayerda",
-            "kim",
-            "kimga",
-            "kimni",
-            "qancha",
-            "qaysi",
-            "mumkinmi",
-            "bilasanmi",
-            "ayt",
-            "aytchi",
-            "what",
-            "why",
-            "how",
-            "when",
-            "where",
-            "who",
-            "which",
-            "can you",
-            "do you",
-            "почему",
-            "как",
-            "когда",
-            "где",
-            "кто",
-            "какой",
-            "можешь",
+        if message_is_reply_to_sara:
+            score += 0.45
+
+        return min(
+            1.0,
+            score,
         )
 
-        lowered = text.lower()
-
-        return any(
-            lowered == word
-            or lowered.startswith(word + " ")
-            for word in question_words
-        )
-
-    # =========================================================
-    # DECISION ENGINE
-    # =========================================================
+    # ========================================================
+    # MAIN DECISION ENGINE
+    # ========================================================
 
     def decide(
         self,
@@ -185,178 +221,190 @@ class ProactiveAgent:
         is_bot_message: bool = False,
     ) -> ProactiveDecision:
 
-        # -----------------------------------------------------
-        # GLOBAL SETTING
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # GLOBAL PROACTIVE SYSTEM
+        # ----------------------------------------------------
 
         if not settings.proactive_group_mode:
+
             return ProactiveDecision(
                 should_respond=False,
-                reason=(
-                    "Proactive mode .env orqali "
-                    "o'chirilgan."
-                ),
+                reason="global_proactive_disabled",
+                confidence=1.0,
             )
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # GROUP ENABLED
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
         if not group_enabled:
+
             return ProactiveDecision(
                 should_respond=False,
-                reason=(
-                    "Bu guruhda AI faol emas."
-                ),
+                reason="group_disabled",
+                confidence=1.0,
             )
 
-        # -----------------------------------------------------
-        # BOT MESSAGE
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # BOT → BOT
+        # ----------------------------------------------------
 
         if is_bot_message:
+
             if not settings.bot_to_bot_mode:
+
                 return ProactiveDecision(
                     should_respond=False,
-                    reason=(
-                        "Bot-to-bot mode o'chirilgan."
-                    ),
+                    reason="bot_to_bot_disabled",
+                    confidence=1.0,
                 )
 
-        # -----------------------------------------------------
-        # EXPLICIT SARA CALL
-        # -----------------------------------------------------
+            # Bot xabariga faqat SARA aniq chaqirilgan bo'lsa
+            # yoki SARA'ga reply bo'lsa javob beradi.
+            #
+            # Bu juda muhim:
+            #
+            # boshqa botlar bilan cheksiz suhbat boshlanib
+            # ketishining oldini oladi.
+
+            if not sara_called and not message_is_reply_to_sara:
+
+                return ProactiveDecision(
+                    should_respond=False,
+                    reason="bot_not_explicitly_addressed",
+                    confidence=0.95,
+                )
+
+        # ----------------------------------------------------
+        # DIRECT CALL
+        # ----------------------------------------------------
 
         if sara_called:
+
             return ProactiveDecision(
                 should_respond=True,
-                reason=(
-                    "SARA explicitly chaqirilgan."
-                ),
+                reason="sara_called",
+                confidence=1.0,
             )
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # REPLY TO SARA
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
         if message_is_reply_to_sara:
+
             return ProactiveDecision(
                 should_respond=True,
-                reason=(
-                    "SARA xabariga reply qilindi."
-                ),
+                reason="reply_to_sara",
+                confidence=1.0,
             )
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # QUIET MODE
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
         if quiet_mode:
+
+            # Quiet mode'da SARA faqat to'g'ridan-to'g'ri
+            # chaqirilganda yuqoridagi qoidalardan o'tadi.
+
             return ProactiveDecision(
                 should_respond=False,
-                reason="Group quiet mode.",
+                reason="quiet_mode",
+                confidence=1.0,
             )
 
-        # -----------------------------------------------------
-        # LONG QUIET PERIOD
-        # -----------------------------------------------------
-
-        if self.should_stay_quiet(
-            chat_id=chat_id
-        ):
-            return ProactiveDecision(
-                should_respond=False,
-                reason=(
-                    "SARA yaqinda javob berdi."
-                ),
-            )
-
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # COOLDOWN
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
-        if not self.cooldown_passed(
+        if not self.cooldown_ready(
             chat_id=chat_id
         ):
+
             return ProactiveDecision(
                 should_respond=False,
-                reason=(
-                    "Proactive cooldown hali tugamagan."
-                ),
+                reason="cooldown",
+                confidence=0.90,
             )
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # QUESTION
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
         if message_is_question:
 
-            # Savolga javob berish ehtimoli yuqori.
-            if random.random() < 0.35:
+            probability = (
+                self.question_probability
+            )
+
+            roll = random.random()
+
+            if roll < probability:
+
                 return ProactiveDecision(
                     should_respond=True,
-                    reason=(
-                        "Savolga proactive javob."
-                    ),
+                    reason="natural_question_opportunity",
+                    confidence=0.65,
                 )
 
-            return ProactiveDecision(
-                should_respond=False,
-                reason=(
-                    "Savol bo'lsa ham proactive "
-                    "javob ehtimoliga tushmadi."
-                ),
-            )
+        # ----------------------------------------------------
+        # RANDOM NATURAL INTERVENTION
+        # ----------------------------------------------------
 
-        # -----------------------------------------------------
-        # NORMAL GROUP CHAT
-        # -----------------------------------------------------
+        roll = random.random()
 
-        # Oddiy suhbatga juda kam aralashadi.
-        if random.random() < 0.04:
+        if roll < self.random_probability:
+
             return ProactiveDecision(
                 should_respond=True,
-                reason=(
-                    "Tasodifiy natural proactive "
-                    "interaction."
-                ),
+                reason="natural_group_intervention",
+                confidence=0.30,
             )
+
+        # ----------------------------------------------------
+        # OTHERWISE SILENT
+        # ----------------------------------------------------
 
         return ProactiveDecision(
             should_respond=False,
-            reason=(
-                "Oddiy xabarga proactive javob "
-                "kerak emas."
+            reason="no_response_opportunity",
+            confidence=0.80,
+        )
+
+    # ========================================================
+    # GROUP STATISTICS
+    # ========================================================
+
+    def get_state(
+        self,
+        *,
+        chat_id: int,
+    ) -> GroupActivity:
+
+        return self._get_state(chat_id)
+
+    def get_stats(
+        self,
+        *,
+        chat_id: int,
+    ) -> dict[str, int | float]:
+
+        state = self._get_state(chat_id)
+
+        return {
+            "message_count": state.message_count,
+            "response_count": state.response_count,
+            "last_activity": state.last_activity,
+            "last_response": state.last_response,
+            "cooldown_remaining": self.cooldown_remaining(
+                chat_id=chat_id
             ),
-        )
+        }
 
-    # =========================================================
-    # GROUP STATE
-    # =========================================================
-
-    def get_last_activity(
-        self,
-        *,
-        chat_id: int,
-    ) -> float | None:
-
-        return self._last_activity.get(
-            chat_id
-        )
-
-    def get_last_response(
-        self,
-        *,
-        chat_id: int,
-    ) -> float | None:
-
-        return self._last_response.get(
-            chat_id
-        )
-
-    # =========================================================
+    # ========================================================
     # RESET
-    # =========================================================
+    # ========================================================
 
     def reset(
         self,
@@ -364,15 +412,68 @@ class ProactiveAgent:
         chat_id: int,
     ) -> None:
 
-        self._last_activity.pop(
+        self._groups.pop(
             chat_id,
             None,
         )
 
-        self._last_response.pop(
+        logger.info(
+            "Proactive state reset | chat=%s",
             chat_id,
-            None,
         )
 
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    def cleanup(
+        self,
+        *,
+        max_idle_seconds: int = 86400,
+    ) -> int:
+
+        now = self._now()
+
+        expired: list[int] = []
+
+        for chat_id, state in self._groups.items():
+
+            last_activity = (
+                state.last_activity
+                or state.last_response
+            )
+
+            if last_activity <= 0:
+                continue
+
+            if (
+                now - last_activity
+                > max_idle_seconds
+            ):
+
+                expired.append(
+                    chat_id
+                )
+
+        for chat_id in expired:
+
+            self._groups.pop(
+                chat_id,
+                None,
+            )
+
+        if expired:
+
+            logger.info(
+                "Proactive cleanup: %s ta group state o'chirildi.",
+                len(expired),
+            )
+
+        return len(expired)
+
+
+# ============================================================
+# GLOBAL INSTANCE
+# ============================================================
 
 proactive_agent = ProactiveAgent()
