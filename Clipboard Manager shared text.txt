@@ -1,0 +1,1443 @@
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from app.agent.planner import ExecutionPlan, PlanStep, PlanStepType
+from app.agent.tools.memory_tool import memory_tool_handler
+from app.agent.tools.reminder_tool import reminder_tool_handler
+from app.agent.tools.registry import ToolResult, tool_registry
+from app.agent.tools.telegram_tool import send_telegram_message
+
+
+logger = logging.getLogger("sara.agent.executor")
+
+
+# ================================================================
+# EXECUTION RESULT
+# ================================================================
+
+@dataclass
+class ExecutionResult:
+    """
+    Executor bajarilishining yakuniy natijasi.
+    """
+
+    success: bool
+    response_text: str = ""
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def completed_steps(self) -> int:
+        return sum(
+            1
+            for step in self.steps
+            if step.get("completed") is True
+        )
+
+    @property
+    def failed_steps(self) -> int:
+        return sum(
+            1
+            for step in self.steps
+            if step.get("error")
+        )
+
+    @property
+    def total_steps(self) -> int:
+        return len(self.steps)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "response_text": self.response_text,
+            "steps": self.steps,
+            "error": self.error,
+            "metadata": self.metadata,
+            "completed_steps": self.completed_steps,
+            "failed_steps": self.failed_steps,
+            "total_steps": self.total_steps,
+        }
+
+
+# ================================================================
+# SARA EXECUTOR
+# ================================================================
+
+class SaraExecutor:
+    """
+    SARA Agent Executor.
+
+    Planner yaratgan ExecutionPlan'ni bosqichma-bosqich bajaradi.
+
+    Pipeline:
+
+        Brain
+          ↓
+        Planner
+          ↓
+        Executor
+          ↓
+        ├── Memory
+        ├── Group Memory
+        ├── Relationship
+        ├── Session State
+        ├── AI Response
+        ├── Reminder
+        ├── Generic Tools
+        └── Telegram
+    """
+
+    def __init__(self) -> None:
+        self._executed_plans = 0
+        self._successful_plans = 0
+        self._failed_plans = 0
+
+    # ============================================================
+    # MAIN EXECUTION
+    # ============================================================
+
+    async def execute(
+        self,
+        plan: ExecutionPlan,
+    ) -> ExecutionResult:
+        """
+        ExecutionPlan'ni to'liq bajaradi.
+
+        Muhim:
+        - required step xato qilsa → plan failure
+        - optional step xato qilsa → keyingi step davom etadi
+        - Telegram yuborilgan bo'lsa → metadata'ga yoziladi
+        - progress property sifatida ishlatiladi
+        """
+
+        started = time.monotonic()
+
+        try:
+            # ----------------------------------------------------
+            # PLAN VALIDATION
+            # ----------------------------------------------------
+
+            self._validate_plan(plan)
+
+            logger.info(
+                "Executing SARA plan | id=%s | action=%s | steps=%s",
+                plan.plan_id,
+                plan.action,
+                len(plan.steps),
+            )
+
+            response_text = ""
+            execution_steps: list[dict[str, Any]] = []
+
+            # ----------------------------------------------------
+            # STEP LOOP
+            # ----------------------------------------------------
+
+            while not plan.completed and not plan.cancelled:
+
+                step = plan.get_current_step()
+
+                # Plan'da boshqa step qolmagan.
+                if step is None:
+                    break
+
+                try:
+                    # ------------------------------------------------
+                    # EXECUTE STEP
+                    # ------------------------------------------------
+
+                    result = await self._execute_step(
+                        plan,
+                        step,
+                    )
+
+                    normalized = self._normalize_tool_result(
+                        result
+                    )
+
+                    # ------------------------------------------------
+                    # RESPONSE TEXT
+                    # ------------------------------------------------
+
+                    step_response = normalized.get(
+                        "response_text",
+                        "",
+                    )
+
+                    if step_response:
+                        response_text = str(
+                            step_response
+                        ).strip()
+
+                        # Plan metadata'da ham saqlaymiz.
+                        plan.metadata[
+                            "response_text"
+                        ] = response_text
+
+                    # ------------------------------------------------
+                    # TELEGRAM SEND STATUS
+                    # ------------------------------------------------
+
+                    if normalized.get(
+                        "telegram_sent"
+                    ):
+                        plan.metadata[
+                            "telegram_sent"
+                        ] = True
+
+                    if normalized.get(
+                        "telegram_message_id"
+                    ) is not None:
+                        plan.metadata[
+                            "telegram_message_id"
+                        ] = normalized[
+                            "telegram_message_id"
+                        ]
+
+                    # ------------------------------------------------
+                    # STEP SUCCESS / FAILURE
+                    # ------------------------------------------------
+
+                    step_success = normalized.get(
+                        "success"
+                    )
+
+                    # Agar tool natijasi aniq False qaytarsa,
+                    # step muvaffaqiyatsiz hisoblanadi.
+                    if step_success is False:
+
+                        error = str(
+                            normalized.get(
+                                "error",
+                                "step_execution_failed",
+                            )
+                        )
+
+                        step.fail(error)
+
+                        execution_steps.append(
+                            step.to_dict()
+                        )
+
+                        plan.fail_current_step(
+                            error
+                        )
+
+                        # Required step bo'lsa butun plan to'xtaydi.
+                        if step.required:
+
+                            self._executed_plans += 1
+                            self._failed_plans += 1
+
+                            logger.error(
+                                "Required SARA step failed | "
+                                "plan=%s | step=%s | error=%s",
+                                plan.plan_id,
+                                step.id,
+                                error,
+                            )
+
+                            return ExecutionResult(
+                                success=False,
+                                response_text=response_text,
+                                steps=execution_steps,
+                                error=error,
+                                metadata=self._execution_metadata(
+                                    plan=plan,
+                                    started=started,
+                                ),
+                            )
+
+                        # Optional step bo'lsa davom etamiz.
+                        logger.warning(
+                            "Optional SARA step failed, "
+                            "continuing plan | "
+                            "plan=%s | step=%s | error=%s",
+                            plan.plan_id,
+                            step.id,
+                            error,
+                        )
+
+                        continue
+
+                    # ------------------------------------------------
+                    # SUCCESSFUL STEP
+                    # ------------------------------------------------
+
+                    step.complete(
+                        normalized
+                    )
+
+                    execution_steps.append(
+                        step.to_dict()
+                    )
+
+                    plan.complete_current_step(
+                        normalized
+                    )
+
+                except Exception as exc:
+
+                    error = str(exc)
+
+                    logger.exception(
+                        "SARA step failed | plan=%s | step=%s",
+                        plan.plan_id,
+                        step.id,
+                    )
+
+                    step.fail(
+                        error
+                    )
+
+                    execution_steps.append(
+                        step.to_dict()
+                    )
+
+                    plan.fail_current_step(
+                        error
+                    )
+
+                    # ------------------------------------------------
+                    # REQUIRED STEP
+                    # ------------------------------------------------
+
+                    if step.required:
+
+                        self._executed_plans += 1
+                        self._failed_plans += 1
+
+                        return ExecutionResult(
+                            success=False,
+                            response_text=response_text,
+                            steps=execution_steps,
+                            error=error,
+                            metadata=self._execution_metadata(
+                                plan=plan,
+                                started=started,
+                            ),
+                        )
+
+                    # ------------------------------------------------
+                    # OPTIONAL STEP
+                    # ------------------------------------------------
+
+                    logger.warning(
+                        "Optional SARA step exception, "
+                        "continuing plan | "
+                        "plan=%s | step=%s",
+                        plan.plan_id,
+                        step.id,
+                    )
+
+            # ========================================================
+            # PLAN CANCELLED
+            # ========================================================
+
+            if plan.cancelled:
+
+                self._executed_plans += 1
+                self._failed_plans += 1
+
+                return ExecutionResult(
+                    success=False,
+                    response_text=response_text,
+                    steps=execution_steps,
+                    error=(
+                        plan.cancel_reason
+                        or "plan_cancelled"
+                    ),
+                    metadata=self._execution_metadata(
+                        plan=plan,
+                        started=started,
+                    ),
+                )
+
+            # ========================================================
+            # PLAN COMPLETED
+            # ========================================================
+
+            self._executed_plans += 1
+            self._successful_plans += 1
+
+            logger.info(
+                "SARA plan completed | id=%s | progress=%.2f",
+                plan.plan_id,
+                plan.progress,
+            )
+
+            return ExecutionResult(
+                success=True,
+                response_text=response_text,
+                steps=execution_steps,
+                metadata=self._execution_metadata(
+                    plan=plan,
+                    started=started,
+                ),
+            )
+
+        # ============================================================
+        # GLOBAL EXECUTION ERROR
+        # ============================================================
+
+        except Exception as exc:
+
+            self._executed_plans += 1
+            self._failed_plans += 1
+
+            logger.exception(
+                "SARA plan execution failed | plan=%s",
+                getattr(
+                    plan,
+                    "plan_id",
+                    "unknown",
+                ),
+            )
+
+            return ExecutionResult(
+                success=False,
+                response_text="",
+                steps=[],
+                error=str(exc),
+                metadata={
+                    "plan_id": getattr(
+                        plan,
+                        "plan_id",
+                        None,
+                    ),
+                    "duration_seconds": round(
+                        time.monotonic() - started,
+                        4,
+                    ),
+                    "timestamp": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                },
+            )
+
+    # ============================================================
+    # STEP EXECUTION
+    # ============================================================
+
+    async def _execute_step(
+        self,
+        plan: ExecutionPlan,
+        step: PlanStep,
+    ) -> Any:
+
+        step_type = step.step_type
+
+        # ==========================================================
+        # ANALYZE
+        # ==========================================================
+
+        if step_type == PlanStepType.ANALYZE:
+
+            return {
+                "success": True,
+                "analysis": {
+                    "action": plan.action,
+                    "user_text": plan.user_text,
+                    "chat_id": plan.metadata.get(
+                        "chat_id"
+                    ),
+                    "user_id": plan.metadata.get(
+                        "user_id"
+                    ),
+                    "group_id": plan.metadata.get(
+                        "group_id"
+                    ),
+                },
+            }
+
+        # ==========================================================
+        # RETRIEVE USER MEMORY
+        # ==========================================================
+
+        if step_type == PlanStepType.RETRIEVE_MEMORY:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            user_id = args.get(
+                "user_telegram_id"
+            )
+
+            query = args.get(
+                "query",
+                plan.user_text,
+            )
+
+            limit = args.get(
+                "limit",
+                10,
+            )
+
+            if user_id is None:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "missing_user_telegram_id"
+                    ),
+                }
+
+            try:
+                limit = max(
+                    1,
+                    min(
+                        int(limit),
+                        100,
+                    ),
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                limit = 10
+
+            return await memory_tool_handler(
+                operation="search_user",
+                user_telegram_id=int(
+                    user_id
+                ),
+                query=str(
+                    query or ""
+                ),
+                limit=limit,
+            )
+
+        # ==========================================================
+        # RETRIEVE GROUP MEMORY
+        # ==========================================================
+
+        if step_type == PlanStepType.RETRIEVE_GROUP_MEMORY:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            group_id = args.get(
+                "group_telegram_id"
+            )
+
+            query = args.get(
+                "query",
+                plan.user_text,
+            )
+
+            limit = args.get(
+                "limit",
+                10,
+            )
+
+            if group_id is None:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "missing_group_telegram_id"
+                    ),
+                }
+
+            try:
+                limit = max(
+                    1,
+                    min(
+                        int(limit),
+                        100,
+                    ),
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                limit = 10
+
+            return await memory_tool_handler(
+                operation="search_group",
+                group_telegram_id=int(
+                    group_id
+                ),
+                query=str(
+                    query or ""
+                ),
+                limit=limit,
+            )
+
+        # ==========================================================
+        # RELATIONSHIP
+        # ==========================================================
+
+        if step_type == PlanStepType.CHECK_RELATIONSHIP:
+
+            return {
+                "success": True,
+                "relationship": plan.metadata.get(
+                    "relationship_context",
+                    {},
+                ),
+            }
+
+        # ==========================================================
+        # SESSION STATE
+        # ==========================================================
+
+        if step_type == PlanStepType.CHECK_SESSION_STATE:
+
+            return {
+                "success": True,
+                "session_state": plan.metadata.get(
+                    "session_state",
+                    {},
+                ),
+            }
+
+        # ==========================================================
+        # GENERATE RESPONSE
+        # ==========================================================
+
+        if step_type == PlanStepType.GENERATE_RESPONSE:
+
+            response_text = str(
+                plan.metadata.get(
+                    "response_text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not response_text:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "empty_generated_response"
+                    ),
+                }
+
+            return {
+                "success": True,
+                "response_text": response_text,
+            }
+
+        # ==========================================================
+        # ASK CLARIFICATION
+        # ==========================================================
+
+        if step_type == PlanStepType.ASK_CLARIFICATION:
+
+            response_text = str(
+                plan.metadata.get(
+                    "response_text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not response_text:
+
+                response_text = (
+                    "Aniqroq tushuntirib bera olasanmi? "
+                    "Nimani nazarda tutganingni bilsam, "
+                    "yaxshiroq yordam beraman."
+                )
+
+            return {
+                "success": True,
+                "response_text": response_text,
+            }
+
+        # ==========================================================
+        # SAVE MEMORY
+        # ==========================================================
+
+        if step_type == PlanStepType.SAVE_MEMORY:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            text = str(
+                args.get(
+                    "text",
+                    plan.user_text,
+                )
+                or ""
+            ).strip()
+
+            if not text:
+
+                return {
+                    "success": False,
+                    "error": "empty_memory_text",
+                }
+
+            user_id = args.get(
+                "user_telegram_id"
+            )
+
+            group_id = args.get(
+                "group_telegram_id"
+            )
+
+            memory_type = str(
+                args.get(
+                    "memory_type",
+                    "important_fact",
+                )
+                or "important_fact"
+            ).strip()
+
+            # Importance
+            try:
+                importance = float(
+                    args.get(
+                        "importance",
+                        0.8,
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                importance = 0.8
+
+            importance = max(
+                0.0,
+                min(
+                    1.0,
+                    importance,
+                ),
+            )
+
+            # Confidence
+            try:
+                confidence = float(
+                    args.get(
+                        "confidence",
+                        0.9,
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                confidence = 0.9
+
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    confidence,
+                ),
+            )
+
+            source_message_id = args.get(
+                "source_message_id"
+            )
+
+            # ------------------------------------------------------
+            # GROUP MEMORY
+            # ------------------------------------------------------
+
+            if group_id is not None:
+
+                return await memory_tool_handler(
+                    operation="save_group",
+                    group_telegram_id=int(
+                        group_id
+                    ),
+                    memory_type=memory_type,
+                    content=text,
+                    importance=importance,
+                    confidence=confidence,
+                    source_message_id=source_message_id,
+                )
+
+            # ------------------------------------------------------
+            # USER MEMORY
+            # ------------------------------------------------------
+
+            if user_id is not None:
+
+                return await memory_tool_handler(
+                    operation="save_user",
+                    user_telegram_id=int(
+                        user_id
+                    ),
+                    memory_type=memory_type,
+                    content=text,
+                    importance=importance,
+                    confidence=confidence,
+                    source_message_id=source_message_id,
+                )
+
+            return {
+                "success": False,
+                "error": "missing_memory_owner",
+            }
+
+        # ==========================================================
+        # CREATE REMINDER
+        # ==========================================================
+
+        if step_type == PlanStepType.CREATE_REMINDER:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            owner_id = args.get(
+                "owner_telegram_id"
+            )
+
+            chat_id = args.get(
+                "chat_id"
+            )
+
+            text = str(
+                args.get(
+                    "text",
+                    plan.user_text,
+                )
+                or ""
+            ).strip()
+
+            if owner_id is None:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "missing_reminder_owner"
+                    ),
+                }
+
+            if chat_id is None:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "missing_reminder_chat_id"
+                    ),
+                }
+
+            if not text:
+
+                return {
+                    "success": False,
+                    "error": (
+                        "empty_reminder_text"
+                    ),
+                }
+
+            return await reminder_tool_handler(
+                operation="create",
+                owner_telegram_id=int(
+                    owner_id
+                ),
+                chat_id=int(
+                    chat_id
+                ),
+                text=text,
+            )
+
+        # ==========================================================
+        # GENERIC TOOL
+        # ==========================================================
+
+        if step_type == PlanStepType.USE_TOOL:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            tool_name = args.pop(
+                "tool_name",
+                None,
+            )
+
+            tool_arguments = args.pop(
+                "tool_arguments",
+                {},
+            )
+
+            if not tool_name:
+
+                return {
+                    "success": False,
+                    "error": "missing_tool_name",
+                }
+
+            if not isinstance(
+                tool_arguments,
+                dict,
+            ):
+                tool_arguments = {}
+
+            try:
+
+                return await tool_registry.execute(
+                    str(
+                        tool_name
+                    ),
+                    **tool_arguments,
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Generic tool execution failed | "
+                    "tool=%s",
+                    tool_name,
+                )
+
+                return {
+                    "success": False,
+                    "error": str(exc),
+                    "tool_name": str(
+                        tool_name
+                    ),
+                }
+
+        # ==========================================================
+        # SEND TELEGRAM RESPONSE
+        # ==========================================================
+
+        if step_type == PlanStepType.SEND_RESPONSE:
+
+            args = dict(
+                step.arguments or {}
+            )
+
+            chat_id = args.get(
+                "chat_id",
+                plan.metadata.get(
+                    "chat_id"
+                ),
+            )
+
+            text = str(
+                args.get(
+                    "text",
+                    plan.metadata.get(
+                        "response_text",
+                        "",
+                    ),
+                )
+                or ""
+            ).strip()
+
+            reply_to_message_id = args.get(
+                "reply_to_message_id",
+                plan.metadata.get(
+                    "reply_to_message_id"
+                ),
+            )
+
+            if chat_id is None:
+
+                return {
+                    "success": False,
+                    "error": "missing_chat_id",
+                }
+
+            if not text:
+
+                return {
+                    "success": False,
+                    "error": "empty_response",
+                }
+
+            # ------------------------------------------------------
+            # SEND
+            # ------------------------------------------------------
+
+            result = await send_telegram_message(
+                chat_id=int(
+                    chat_id
+                ),
+                text=text,
+                reply_to_message_id=(
+                    int(
+                        reply_to_message_id
+                    )
+                    if reply_to_message_id
+                    is not None
+                    else None
+                ),
+            )
+
+            normalized = (
+                self._normalize_tool_result(
+                    result
+                )
+            )
+
+            # ------------------------------------------------------
+            # TELEGRAM SUCCESS
+            # ------------------------------------------------------
+
+            if normalized.get(
+                "success"
+            ):
+
+                normalized[
+                    "telegram_sent"
+                ] = True
+
+                if normalized.get(
+                    "message_id"
+                ) is not None:
+
+                    try:
+                        telegram_message_id = int(
+                            normalized[
+                                "message_id"
+                            ]
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        telegram_message_id = None
+
+                    if telegram_message_id is not None:
+
+                        normalized[
+                            "telegram_message_id"
+                        ] = telegram_message_id
+
+                        plan.metadata[
+                            "telegram_message_id"
+                        ] = telegram_message_id
+
+                plan.metadata[
+                    "telegram_sent"
+                ] = True
+
+            # ------------------------------------------------------
+            # RESPONSE TEXT
+            # ------------------------------------------------------
+
+            normalized[
+                "response_text"
+            ] = text
+
+            return normalized
+
+        # ==========================================================
+        # FINISH
+        # ==========================================================
+
+        if step_type == PlanStepType.FINISH:
+
+            return {
+                "success": True,
+                "finished": True,
+            }
+
+        # ==========================================================
+        # UNKNOWN STEP
+        # ==========================================================
+
+        return {
+            "success": False,
+            "error": (
+                "unsupported_plan_step:"
+                f"{step_type}"
+            ),
+        }
+
+    # ============================================================
+    # PLAN VALIDATION
+    # ============================================================
+
+    def _validate_plan(
+        self,
+        plan: ExecutionPlan,
+    ) -> None:
+        """
+        ExecutionPlan executor uchun yaroqli ekanini tekshiradi.
+        """
+
+        if plan is None:
+            raise ValueError(
+                "ExecutionPlan is None"
+            )
+
+        required_attributes = (
+            "plan_id",
+            "action",
+            "steps",
+            "metadata",
+            "user_text",
+            "get_current_step",
+            "complete_current_step",
+            "fail_current_step",
+        )
+
+        for attribute in required_attributes:
+
+            if not hasattr(
+                plan,
+                attribute,
+            ):
+                raise ValueError(
+                    "Invalid ExecutionPlan: "
+                    f"missing attribute '{attribute}'"
+                )
+
+        if not isinstance(
+            plan.steps,
+            list,
+        ):
+            raise ValueError(
+                "Invalid ExecutionPlan: "
+                "steps must be a list"
+            )
+
+        if not isinstance(
+            plan.metadata,
+            dict,
+        ):
+            raise ValueError(
+                "Invalid ExecutionPlan: "
+                "metadata must be a dict"
+            )
+
+        if not plan.steps:
+
+            raise ValueError(
+                "Invalid ExecutionPlan: "
+                "plan has no steps"
+            )
+
+        for step in plan.steps:
+
+            if not isinstance(
+                step,
+                PlanStep,
+            ):
+                raise ValueError(
+                    "Invalid ExecutionPlan: "
+                    "all steps must be PlanStep instances"
+                )
+
+    # ============================================================
+    # TOOL RESULT NORMALIZER
+    # ============================================================
+
+    def _normalize_tool_result(
+        self,
+        result: Any,
+    ) -> dict[str, Any]:
+        """
+        Har xil tool natijalarini yagona dict formatiga o'tkazadi.
+
+        Qo'llab-quvvatlanadi:
+
+            ToolResult
+            dict
+            str
+            bool
+            None
+            boshqa object
+        """
+
+        # --------------------------------------------------------
+        # ToolResult
+        # --------------------------------------------------------
+
+        if isinstance(
+            result,
+            ToolResult,
+        ):
+
+            try:
+
+                data = result.to_dict()
+
+                if isinstance(
+                    data,
+                    dict,
+                ):
+                    return self._ensure_success_field(
+                        data
+                    )
+
+            except Exception:
+
+                logger.exception(
+                    "ToolResult.to_dict() failed"
+                )
+
+            # Fallback
+            return {
+                "success": bool(
+                    getattr(
+                        result,
+                        "success",
+                        False,
+                    )
+                ),
+                "response_text": str(
+                    getattr(
+                        result,
+                        "message",
+                        "",
+                    )
+                    or ""
+                ),
+            }
+
+        # --------------------------------------------------------
+        # Dict
+        # --------------------------------------------------------
+
+        if isinstance(
+            result,
+            dict,
+        ):
+
+            normalized = dict(
+                result
+            )
+
+            return self._ensure_success_field(
+                normalized
+            )
+
+        # --------------------------------------------------------
+        # String
+        # --------------------------------------------------------
+
+        if isinstance(
+            result,
+            str,
+        ):
+
+            text = result.strip()
+
+            return {
+                "success": bool(
+                    text
+                ),
+                "response_text": text,
+            }
+
+        # --------------------------------------------------------
+        # None
+        # --------------------------------------------------------
+
+        if result is None:
+
+            return {
+                "success": True,
+            }
+
+        # --------------------------------------------------------
+        # Boolean
+        # --------------------------------------------------------
+
+        if isinstance(
+            result,
+            bool,
+        ):
+
+            return {
+                "success": result,
+            }
+
+        # --------------------------------------------------------
+        # Generic Object
+        # --------------------------------------------------------
+
+        return {
+            "success": True,
+            "result": result,
+        }
+
+    # ============================================================
+    # ENSURE SUCCESS FIELD
+    # ============================================================
+
+    @staticmethod
+    def _ensure_success_field(
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Tool result ichida success field bo'lmasa,
+        xavfsiz default beradi.
+        """
+
+        if "success" not in data:
+
+            # Agar error bor bo'lsa → failure.
+            if data.get(
+                "error"
+            ):
+                data["success"] = False
+
+            else:
+                data["success"] = True
+
+        return data
+
+    # ============================================================
+    # EXECUTION METADATA
+    # ============================================================
+
+    def _execution_metadata(
+        self,
+        *,
+        plan: ExecutionPlan,
+        started: float,
+    ) -> dict[str, Any]:
+        """
+        Execution haqida statistik metadata.
+        """
+
+        try:
+            progress = float(
+                plan.progress
+            )
+        except (
+            TypeError,
+            ValueError,
+            AttributeError,
+        ):
+            progress = 0.0
+
+        try:
+            completed = bool(
+                plan.completed
+            )
+        except AttributeError:
+            completed = False
+
+        try:
+            cancelled = bool(
+                plan.cancelled
+            )
+        except AttributeError:
+            cancelled = False
+
+        try:
+            current_step = plan.get_current_step()
+
+            current_step_id = (
+                current_step.id
+                if current_step is not None
+                else None
+            )
+
+        except Exception:
+            current_step_id = None
+
+        return {
+            "plan_id": getattr(
+                plan,
+                "plan_id",
+                None,
+            ),
+            "action": str(
+                getattr(
+                    plan,
+                    "action",
+                    "",
+                )
+            ),
+            "progress": progress,
+            "completed": completed,
+            "cancelled": cancelled,
+            "current_step_id": current_step_id,
+            "step_count": len(
+                getattr(
+                    plan,
+                    "steps",
+                    [],
+                )
+            ),
+            "telegram_sent": bool(
+                plan.metadata.get(
+                    "telegram_sent",
+                    False,
+                )
+            ),
+            "telegram_message_id": plan.metadata.get(
+                "telegram_message_id"
+            ),
+            "duration_seconds": round(
+                time.monotonic() - started,
+                4,
+            ),
+            "timestamp": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        }
+
+    # ============================================================
+    # STATS
+    # ============================================================
+
+    def stats(self) -> dict[str, Any]:
+        """
+        Executor statistikasi.
+        """
+
+        total = self._executed_plans
+
+        success_rate = (
+            self._successful_plans / total
+            if total > 0
+            else 0.0
+        )
+
+        return {
+            "executed_plans": self._executed_plans,
+            "successful_plans": self._successful_plans,
+            "failed_plans": self._failed_plans,
+            "success_rate": round(
+                success_rate,
+                4,
+            ),
+        }
+
+    # ============================================================
+    # RESET STATS
+    # ============================================================
+
+    def reset_stats(self) -> None:
+        """
+        Executor statistikalarini nolga qaytaradi.
+        """
+
+        self._executed_plans = 0
+        self._successful_plans = 0
+        self._failed_plans = 0
+
+        logger.info(
+            "SARA Executor statistics reset."
+        )
+
+
+# ================================================================
+# GLOBAL EXECUTOR
+# ================================================================
+
+sara_executor = SaraExecutor()
+
+
+__all__ = [
+    "ExecutionResult",
+    "SaraExecutor",
+    "sara_executor",
+]
