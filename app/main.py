@@ -7,18 +7,29 @@ import sys
 from aiogram import Bot, Dispatcher
 
 from app.agent.tools.memory_tool import memory_tool_handler
+from app.agent.tools.reminder_tool import reminder_tool_handler
+
 from app.agent.tools.telegram_tool import (
     configure_telegram_tool,
     send_telegram_message,
 )
+
 from app.agent.tool_registry import tool_registry
+
 from app.bot.router import create_router
+
 from app.config.settings import settings
+
 from app.database.init import init_database
 from app.database.session import close_database
+
 from app.scheduler.manager import scheduler_manager
 from app.scheduler.recovery import restore_reminders
 
+
+# ================================================================
+# LOGGING
+# ================================================================
 
 logging.basicConfig(
     level=getattr(
@@ -37,24 +48,30 @@ logging.basicConfig(
 logger = logging.getLogger("sara")
 
 
+# ================================================================
+# TOOL REGISTRATION
+# ================================================================
+
 def register_tools(bot: Bot) -> None:
     """
-    SARA foydalanadigan barcha real tool'larni
+    SARA foydalanadigan barcha real Tool'larni
     Tool Registry'ga ulaydi.
     """
 
-    # =========================================================
+    # ============================================================
     # TELEGRAM TOOL
-    # =========================================================
+    # ============================================================
 
     configure_telegram_tool(bot)
 
-    if not tool_registry.exists("telegram_send_message"):
+    if not tool_registry.exists(
+        "telegram_send_message"
+    ):
         tool_registry.register(
             name="telegram_send_message",
             description=(
-                "Telegram chat yoki guruhga xabar yuboradi. "
-                "SARA mustaqil ravishda javob yoki xabar yuborishi mumkin."
+                "Telegram chat yoki guruhga "
+                "xabar yuboradi."
             ),
             handler=send_telegram_message,
             enabled=True,
@@ -62,19 +79,20 @@ def register_tools(bot: Bot) -> None:
             timeout=30,
         )
 
-    # =========================================================
+    # ============================================================
     # MEMORY TOOL
-    # =========================================================
+    # ============================================================
 
-    if not tool_registry.exists("memory"):
+    if not tool_registry.exists(
+        "memory"
+    ):
         tool_registry.register(
             name="memory",
             description=(
                 "SARA xotira tizimi. "
-                "User va group memory saqlash, qidirish, "
-                "ko'rish, o'chirish va sanash imkonini beradi. "
-                "SARA suhbatlardan kerakli ma'lumotlarni "
-                "uzoq muddatli xotiraga saqlashi mumkin."
+                "User va group memory saqlash, "
+                "qidirish, ko'rish, o'chirish "
+                "va sanash imkonini beradi."
             ),
             handler=memory_tool_handler,
             enabled=True,
@@ -82,16 +100,49 @@ def register_tools(bot: Bot) -> None:
             timeout=30,
         )
 
+    # ============================================================
+    # REMINDER TOOL
+    # ============================================================
+
+    if not tool_registry.exists(
+        "reminder"
+    ):
+        tool_registry.register(
+            name="reminder",
+            description=(
+                "SARA reminder tizimi. "
+                "Natural language orqali reminder yaratish, "
+                "reminderlarni ko'rish, olish va bekor qilish "
+                "imkonini beradi. Reminder DB'da saqlanadi "
+                "va APScheduler orqali bajariladi."
+            ),
+            handler=reminder_tool_handler,
+            enabled=True,
+            dangerous=False,
+            timeout=30,
+        )
+
+    # ============================================================
+    # LOG
+    # ============================================================
+
     logger.info(
         "Registered tools: %s",
-        tool_registry.list_tools(enabled_only=True),
+        tool_registry.list_tools(
+            enabled_only=True
+        ),
     )
 
 
+# ================================================================
+# MAIN
+# ================================================================
+
 async def main() -> None:
-    # =========================================================
+
+    # ============================================================
     # CONFIG CHECK
-    # =========================================================
+    # ============================================================
 
     if not settings.bot_token:
         raise RuntimeError(
@@ -108,23 +159,35 @@ async def main() -> None:
             "OPENROUTER_MODEL .env ichida sozlanmagan."
         )
 
-    logger.info("==========================================")
-    logger.info("          SARA AI STARTING")
-    logger.info("==========================================")
+    logger.info(
+        "=========================================="
+    )
 
-    # =========================================================
+    logger.info(
+        "          SARA AI STARTING"
+    )
+
+    logger.info(
+        "=========================================="
+    )
+
+    # ============================================================
     # DATABASE
-    # =========================================================
+    # ============================================================
 
     await init_database()
 
-    logger.info("Database tayyor.")
+    logger.info(
+        "Database tayyor."
+    )
 
-    # =========================================================
+    # ============================================================
     # TELEGRAM
-    # =========================================================
+    # ============================================================
 
-    bot = Bot(token=settings.bot_token)
+    bot = Bot(
+        token=settings.bot_token
+    )
 
     dispatcher = Dispatcher()
 
@@ -132,24 +195,29 @@ async def main() -> None:
         create_router()
     )
 
-    # =========================================================
-    # AGENT TOOLS
-    # =========================================================
+    # ============================================================
+    # TOOLS
+    # ============================================================
 
-    register_tools(bot)
+    register_tools(
+        bot
+    )
 
     logger.info(
         "SARA Tool Registry: %s",
         tool_registry.stats(),
     )
 
-    # =========================================================
+    # ============================================================
     # SCHEDULER
-    # =========================================================
+    # ============================================================
 
-    scheduler_manager.set_bot(bot)
+    scheduler_manager.set_bot(
+        bot
+    )
 
     try:
+
         me = await bot.get_me()
 
         logger.info(
@@ -161,11 +229,12 @@ async def main() -> None:
             drop_pending_updates=True
         )
 
-        # =====================================================
+        # ========================================================
         # REMINDERS
-        # =====================================================
+        # ========================================================
 
         if settings.reminder_enabled:
+
             scheduler_manager.start()
 
             logger.info(
@@ -180,13 +249,14 @@ async def main() -> None:
             )
 
         else:
+
             logger.info(
                 "Reminder system o'chirilgan."
             )
 
-        # =====================================================
+        # ========================================================
         # READY
-        # =====================================================
+        # ========================================================
 
         logger.info(
             "SARA AI ishga tushdi."
@@ -201,6 +271,10 @@ async def main() -> None:
         )
 
         logger.info(
+            "Reminder Tool: ENABLED"
+        )
+
+        logger.info(
             "Agent Brain: ENABLED"
         )
 
@@ -212,35 +286,58 @@ async def main() -> None:
             "Agent Executor: ENABLED"
         )
 
+        # ========================================================
+        # POLLING
+        # ========================================================
+
         await dispatcher.start_polling(
             bot
         )
 
     finally:
+
         logger.info(
             "SARA AI to'xtatilmoqda..."
         )
 
+        # ========================================================
+        # SCHEDULER STOP
+        # ========================================================
+
         try:
+
             await scheduler_manager.stop()
 
         except Exception:
+
             logger.exception(
                 "Scheduler stop xatosi."
             )
 
+        # ========================================================
+        # TELEGRAM CLOSE
+        # ========================================================
+
         try:
+
             await bot.session.close()
 
         except Exception:
+
             logger.exception(
                 "Telegram session close xatosi."
             )
 
+        # ========================================================
+        # DATABASE CLOSE
+        # ========================================================
+
         try:
+
             await close_database()
 
         except Exception:
+
             logger.exception(
                 "Database close xatosi."
             )
@@ -250,16 +347,26 @@ async def main() -> None:
         )
 
 
+# ================================================================
+# ENTRY POINT
+# ================================================================
+
 if __name__ == "__main__":
+
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
+
         logger.info(
             "SARA AI foydalanuvchi tomonidan to'xtatildi."
         )
 
     except Exception:
+
         logger.exception(
             "SARA AI critical error."
         )
