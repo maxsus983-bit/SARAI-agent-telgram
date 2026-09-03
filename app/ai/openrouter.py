@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -14,26 +15,46 @@ from app.ai.models import AIResponse
 from app.config.settings import settings
 
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+logger = logging.getLogger("sara.openrouter")
+
+
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
 
 
 class OpenRouterError(Exception):
-    pass
+    """OpenRouter bilan bog'liq xato."""
 
 
 class OpenRouterClient:
+    """
+    OpenRouter API client.
+
+    SARA AI uchun barcha AI requestlar shu client orqali
+    o'tadi.
+    """
 
     def __init__(self) -> None:
+        self.api_key = settings.openrouter_api_key.strip()
 
-        self.api_key = settings.openrouter_api_key
-
-        self.primary_model = settings.openrouter_model
-
-        self.fallback_model = (
-            settings.openrouter_fallback_model
+        self.primary_model = (
+            settings.openrouter_model.strip()
         )
 
+        self.fallback_model = (
+            settings.openrouter_fallback_model.strip()
+        )
+
+    # ==========================================================
+    # HEADERS
+    # ==========================================================
+
     def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise OpenRouterError(
+                "OPENROUTER_API_KEY sozlanmagan."
+            )
 
         return {
             "Authorization": f"Bearer {self.api_key}",
@@ -42,9 +63,16 @@ class OpenRouterClient:
             "X-Title": "SARA AI Telegram Assistant",
         }
 
+    # ==========================================================
+    # REQUEST
+    # ==========================================================
+
     @retry(
         retry=retry_if_exception_type(
-            (httpx.TimeoutException, httpx.NetworkError)
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+            )
         ),
         stop=stop_after_attempt(3),
         wait=wait_exponential(
@@ -56,14 +84,31 @@ class OpenRouterClient:
     )
     async def _request(
         self,
+        *,
         model: str,
         messages: list[dict[str, Any]],
+        temperature: float = 0.7,
     ) -> AIResponse:
 
-        payload = {
+        model = str(model).strip()
+
+        if not model:
+            raise OpenRouterError(
+                "OpenRouter model bo'sh."
+            )
+
+        if not messages:
+            raise OpenRouterError(
+                "OpenRouter messages bo'sh."
+            )
+
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.7,
+            "temperature": max(
+                0.0,
+                min(float(temperature), 2.0),
+            ),
         }
 
         timeout = httpx.Timeout(
@@ -73,47 +118,183 @@ class OpenRouterClient:
             pool=10.0,
         )
 
-        async with httpx.AsyncClient(
-            timeout=timeout
-        ) as client:
+        try:
 
-            response = await client.post(
-                OPENROUTER_URL,
-                headers=self._headers(),
-                json=payload,
-            )
+            async with httpx.AsyncClient(
+                timeout=timeout
+            ) as client:
 
-            if response.status_code >= 400:
-
-                raise OpenRouterError(
-                    f"OpenRouter HTTP "
-                    f"{response.status_code}: "
-                    f"{response.text[:500]}"
+                response = await client.post(
+                    OPENROUTER_URL,
+                    headers=self._headers(),
+                    json=payload,
                 )
 
-            data = response.json()
-
-        try:
-            text = data["choices"][0]["message"]["content"]
-
         except (
-            KeyError,
-            IndexError,
-            TypeError,
-        ) as exc:
+            httpx.TimeoutException,
+            httpx.NetworkError,
+        ):
+            raise
+
+        except httpx.HTTPError as exc:
 
             raise OpenRouterError(
-                "OpenRouter javobi noto'g'ri formatda."
+                f"OpenRouter HTTP client xatosi: "
+                f"{type(exc).__name__}"
             ) from exc
 
-        if isinstance(text, list):
+        # ------------------------------------------------------
+        # HTTP ERROR
+        # ------------------------------------------------------
 
-            text = "".join(
-                str(item)
-                for item in text
+        if response.status_code >= 400:
+
+            error_text = response.text[:1000]
+
+            if response.status_code == 401:
+
+                raise OpenRouterError(
+                    "OpenRouter API key noto'g'ri "
+                    "yoki yaroqsiz."
+                )
+
+            if response.status_code == 403:
+
+                raise OpenRouterError(
+                    "OpenRouter request rad etildi."
+                )
+
+            if response.status_code == 429:
+
+                raise OpenRouterError(
+                    "OpenRouter rate limitga tushdi."
+                )
+
+            if response.status_code >= 500:
+
+                raise OpenRouterError(
+                    f"OpenRouter server xatosi "
+                    f"HTTP {response.status_code}."
+                )
+
+            raise OpenRouterError(
+                f"OpenRouter HTTP "
+                f"{response.status_code}: "
+                f"{error_text}"
             )
 
-        text = str(text).strip()
+        # ------------------------------------------------------
+        # JSON
+        # ------------------------------------------------------
+
+        try:
+            data: Any = response.json()
+
+        except ValueError as exc:
+
+            raise OpenRouterError(
+                "OpenRouter JSON bo'lmagan javob qaytardi."
+            ) from exc
+
+        if not isinstance(data, dict):
+
+            raise OpenRouterError(
+                "OpenRouter response object emas."
+            )
+
+        # ------------------------------------------------------
+        # API ERROR OBJECT
+        # ------------------------------------------------------
+
+        if data.get("error"):
+
+            error = data.get("error")
+
+            if isinstance(error, dict):
+
+                message = str(
+                    error.get(
+                        "message",
+                        "Unknown OpenRouter error",
+                    )
+                )
+
+            else:
+
+                message = str(error)
+
+            raise OpenRouterError(
+                f"OpenRouter API error: {message[:800]}"
+            )
+
+        # ------------------------------------------------------
+        # CHOICES
+        # ------------------------------------------------------
+
+        choices = data.get("choices")
+
+        if not isinstance(choices, list) or not choices:
+
+            raise OpenRouterError(
+                "OpenRouter javobida choices mavjud emas."
+            )
+
+        first_choice = choices[0]
+
+        if not isinstance(first_choice, dict):
+
+            raise OpenRouterError(
+                "OpenRouter choice noto'g'ri formatda."
+            )
+
+        message = first_choice.get("message")
+
+        if not isinstance(message, dict):
+
+            raise OpenRouterError(
+                "OpenRouter message noto'g'ri formatda."
+            )
+
+        content = message.get("content")
+
+        # ------------------------------------------------------
+        # CONTENT
+        # ------------------------------------------------------
+
+        if isinstance(content, str):
+
+            text = content
+
+        elif isinstance(content, list):
+
+            parts: list[str] = []
+
+            for item in content:
+
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+
+                if isinstance(item, dict):
+
+                    text_value = item.get("text")
+
+                    if text_value is not None:
+                        parts.append(
+                            str(text_value)
+                        )
+
+            text = "".join(parts)
+
+        elif content is None:
+
+            text = ""
+
+        else:
+
+            text = str(content)
+
+        text = text.strip()
 
         if not text:
 
@@ -121,56 +302,133 @@ class OpenRouterClient:
                 "AI bo'sh javob qaytardi."
             )
 
+        # ------------------------------------------------------
+        # USAGE
+        # ------------------------------------------------------
+
+        usage = data.get("usage")
+
+        if not isinstance(usage, dict):
+            usage = None
+
         return AIResponse(
             text=text,
-            model=model,
-            usage=data.get("usage"),
+            model=str(
+                data.get("model") or model
+            ),
+            usage=usage,
             raw=data,
         )
 
+    # ==========================================================
+    # CHAT
+    # ==========================================================
+
     async def chat(
         self,
+        *,
         messages: list[dict[str, Any]],
+        temperature: float = 0.7,
     ) -> AIResponse:
 
         if not self.api_key:
+
             raise OpenRouterError(
                 "OPENROUTER_API_KEY sozlanmagan."
             )
 
         if not self.primary_model:
+
             raise OpenRouterError(
                 "OPENROUTER_MODEL sozlanmagan."
             )
 
+        # ------------------------------------------------------
+        # PRIMARY
+        # ------------------------------------------------------
+
         try:
 
-            return await self._request(
+            result = await self._request(
                 model=self.primary_model,
                 messages=messages,
+                temperature=temperature,
             )
+
+            logger.debug(
+                "OpenRouter primary model success: %s",
+                result.model,
+            )
+
+            return result
 
         except Exception as primary_error:
 
+            logger.warning(
+                "Primary OpenRouter model failed: %s",
+                type(primary_error).__name__,
+            )
+
+            # Fallback yo'q bo'lsa
             if not self.fallback_model:
+
+                if isinstance(
+                    primary_error,
+                    OpenRouterError,
+                ):
+                    raise
+
                 raise OpenRouterError(
-                    f"Asosiy AI model ishlamadi: "
-                    f"{primary_error}"
+                    "Asosiy AI model ishlamadi."
                 ) from primary_error
 
-            try:
+        # ------------------------------------------------------
+        # FALLBACK
+        # ------------------------------------------------------
 
-                return await self._request(
-                    model=self.fallback_model,
-                    messages=messages,
-                )
+        try:
 
-            except Exception as fallback_error:
+            logger.info(
+                "Trying OpenRouter fallback model: %s",
+                self.fallback_model,
+            )
 
-                raise OpenRouterError(
-                    "Asosiy va fallback AI modellar "
-                    "ishlamadi."
-                ) from fallback_error
+            result = await self._request(
+                model=self.fallback_model,
+                messages=messages,
+                temperature=temperature,
+            )
 
+            logger.info(
+                "OpenRouter fallback model success: %s",
+                result.model,
+            )
+
+            return result
+
+        except Exception as fallback_error:
+
+            logger.error(
+                "Fallback OpenRouter model failed: %s",
+                type(fallback_error).__name__,
+            )
+
+            raise OpenRouterError(
+                "Asosiy va fallback AI modellar "
+                "ishlamadi."
+            ) from fallback_error
+
+
+# ==========================================================
+# GLOBAL CLIENT
+# ==========================================================
 
 openrouter = OpenRouterClient()
+
+
+__all__ = [
+    "OPENROUTER_URL",
+    "OpenRouterError",
+    "OpenRouterClient",
+    "openrouter",
+                ]
