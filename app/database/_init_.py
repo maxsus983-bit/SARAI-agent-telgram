@@ -1,3 +1,1 @@
-"""
-SARA AI Database Package.
-"""
+"""SARA AI database package."""
