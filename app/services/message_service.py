@@ -8,13 +8,17 @@ from app.database.session import SessionFactory
 
 class MessageService:
     """
-    Telegram xabarlarini DBga saqlash servisi.
+    SARA AI Telegram message service.
 
     Asosiy API:
-        save(...)
+        save()
 
     Compatibility API:
-        save_message(...)
+        save_message()
+
+    Eski va yangi handlerlar ikkalasi ham
+    ishlashi uchun save_message() save() ga
+    yo'naltiriladi.
     """
 
     async def save(
@@ -31,13 +35,12 @@ class MessageService:
     ) -> Message:
 
         async with SessionFactory() as session:
-
             message = Message(
                 telegram_message_id=telegram_message_id,
                 chat_id=chat_id,
                 user_telegram_id=user_telegram_id,
                 role=role,
-                content=str(content or ""),
+                content=content,
                 message_type=message_type,
                 reply_to_message_id=reply_to_message_id,
                 is_bot_message=is_bot_message,
@@ -63,13 +66,10 @@ class MessageService:
         is_bot_message: bool = False,
     ) -> Message:
         """
-        Compatibility wrapper.
+        Backward-compatible API.
 
-        Eski handler:
-            save_message(...)
-
-        yangi service:
-            save(...)
+        private.py va boshqa eski handlerlar
+        save_message() ishlatsa ham ishlaydi.
         """
 
         return await self.save(
@@ -90,4 +90,4 @@ message_service = MessageService()
 __all__ = [
     "MessageService",
     "message_service",
-        ]
+]
