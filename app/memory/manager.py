@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import re
 from typing import Optional
 
 from sqlalchemy import delete, func, or_, select
@@ -8,13 +10,110 @@ from app.database.models import GroupMemory, UserMemory
 from app.database.session import SessionFactory
 
 
+logger = logging.getLogger("sara.memory.manager")
+
+
 class MemoryManager:
     """
-    SARA AI doimiy xotirasini boshqaradi.
+    SARA AI doimiy xotira menejeri.
 
-    Xotira database'da saqlanadi.
-    Bot restart bo'lsa ham ma'lumotlar qoladi.
+    Vazifalari:
+        - User memory
+        - Group memory
+        - Search
+        - Duplicate detection
+        - Memory update
+        - Soft delete
+        - Restore
+        - Count
+        - Context generation
+
+    Muhim:
+        Raw conversation history database'dagi Message jadvalida
+        alohida saqlanadi.
+
+        UserMemory / GroupMemory esa AI uchun foydali
+        uzoq muddatli xotira sifatida ishlaydi.
     """
+
+    MAX_LIMIT = 100
+    MIN_IMPORTANCE = 0
+    MAX_IMPORTANCE = 100
+    MIN_CONFIDENCE = 0.0
+    MAX_CONFIDENCE = 1.0
+
+    # ==========================================================
+    # SECURITY
+    # ==========================================================
+
+    _SECRET_PATTERNS = (
+        re.compile(r"sk-[A-Za-z0-9_\-]{10,}", re.I),
+        re.compile(r"sk-or-[A-Za-z0-9_\-]{10,}", re.I),
+        re.compile(r"bot\d+:[A-Za-z0-9_\-]{20,}", re.I),
+        re.compile(r"bearer\s+[A-Za-z0-9._\-]{10,}", re.I),
+        re.compile(r"(api[_\- ]?key)\s*[:=]\s*\S+", re.I),
+        re.compile(r"(password|passwd|parol)\s*[:=]\s*\S+", re.I),
+        re.compile(r"(token)\s*[:=]\s*\S+", re.I),
+    )
+
+    @classmethod
+    def _contains_secret(cls, text: str) -> bool:
+        """Matn ichida API key/token/passwordga o‘xshash secret borligini tekshiradi."""
+        if not text:
+            return False
+
+        return any(
+            pattern.search(text)
+            for pattern in cls._SECRET_PATTERNS
+        )
+
+    @classmethod
+    def _normalize_content(cls, content: str) -> str:
+        """Memory matnini standartlashtiradi."""
+        if content is None:
+            return ""
+
+        return " ".join(str(content).strip().split())
+
+    @classmethod
+    def _normalize_memory_type(cls, memory_type: str) -> str:
+        if not memory_type:
+            return "IMPORTANT_FACT"
+
+        return str(memory_type).strip().upper()[:100]
+
+    @classmethod
+    def _clamp_importance(cls, importance: int) -> int:
+        try:
+            value = int(importance)
+        except (TypeError, ValueError):
+            value = 50
+
+        return max(
+            cls.MIN_IMPORTANCE,
+            min(cls.MAX_IMPORTANCE, value),
+        )
+
+    @classmethod
+    def _clamp_confidence(cls, confidence: float) -> float:
+        try:
+            value = float(confidence)
+        except (TypeError, ValueError):
+            value = 1.0
+
+        return max(
+            cls.MIN_CONFIDENCE,
+            min(cls.MAX_CONFIDENCE, value),
+        )
+
+    @classmethod
+    def _safe_limit(cls, limit: int) -> int:
+        try:
+            value = int(limit)
+        except (TypeError, ValueError):
+            value = 15
+
+        return max(1, min(value, cls.MAX_LIMIT))
 
     # ==========================================================
     # USER MEMORY
@@ -30,53 +129,105 @@ class MemoryManager:
         source_message_id: Optional[int] = None,
     ) -> UserMemory:
 
-        importance = max(0, min(100, importance))
-        confidence = max(0.0, min(1.0, confidence))
+        content = self._normalize_content(content)
+        memory_type = self._normalize_memory_type(memory_type)
+        importance = self._clamp_importance(importance)
+        confidence = self._clamp_confidence(confidence)
+
+        if not content:
+            raise ValueError("Memory content bo‘sh bo‘lishi mumkin emas.")
+
+        if self._contains_secret(content):
+            raise ValueError(
+                "Secret/API key/token/password memory'ga saqlanmaydi."
+            )
 
         async with SessionFactory() as session:
-
-            # Bir xil xotirani qayta-qayta saqlamaslik.
-            existing_query = select(UserMemory).where(
-                UserMemory.user_telegram_id == user_telegram_id,
-                UserMemory.content == content,
-                UserMemory.active.is_(True),
-            )
-
-            result = await session.execute(existing_query)
-            existing = result.scalar_one_or_none()
-
-            if existing:
-                existing.importance = max(
-                    existing.importance,
-                    importance,
+            try:
+                # Avval active memory qidiramiz.
+                query = select(UserMemory).where(
+                    UserMemory.user_telegram_id == user_telegram_id,
+                    UserMemory.content == content,
+                    UserMemory.active.is_(True),
                 )
 
-                existing.confidence = max(
-                    existing.confidence,
-                    confidence,
+                result = await session.execute(query)
+                existing = result.scalar_one_or_none()
+
+                if existing:
+                    existing.importance = max(
+                        existing.importance,
+                        importance,
+                    )
+
+                    existing.confidence = max(
+                        existing.confidence,
+                        confidence,
+                    )
+
+                    if source_message_id is not None:
+                        existing.source_message_id = source_message_id
+
+                    await session.commit()
+                    await session.refresh(existing)
+
+                    return existing
+
+                # Agar oldin soft-delete qilingan aynan shu memory mavjud bo‘lsa,
+                # uni qayta active qilamiz.
+                inactive_query = select(UserMemory).where(
+                    UserMemory.user_telegram_id == user_telegram_id,
+                    UserMemory.content == content,
+                    UserMemory.active.is_(False),
                 )
+
+                result = await session.execute(inactive_query)
+                inactive = result.scalar_one_or_none()
+
+                if inactive:
+                    inactive.active = True
+                    inactive.memory_type = memory_type
+                    inactive.importance = importance
+                    inactive.confidence = confidence
+
+                    if source_message_id is not None:
+                        inactive.source_message_id = source_message_id
+
+                    await session.commit()
+                    await session.refresh(inactive)
+
+                    return inactive
+
+                memory = UserMemory(
+                    user_telegram_id=user_telegram_id,
+                    memory_type=memory_type,
+                    content=content,
+                    importance=importance,
+                    confidence=confidence,
+                    source_message_id=source_message_id,
+                    active=True,
+                )
+
+                session.add(memory)
 
                 await session.commit()
-                await session.refresh(existing)
+                await session.refresh(memory)
 
-                return existing
+                logger.debug(
+                    "User memory saved | user=%s | type=%s",
+                    user_telegram_id,
+                    memory_type,
+                )
 
-            memory = UserMemory(
-                user_telegram_id=user_telegram_id,
-                memory_type=memory_type,
-                content=content,
-                importance=importance,
-                confidence=confidence,
-                source_message_id=source_message_id,
-                active=True,
-            )
+                return memory
 
-            session.add(memory)
-
-            await session.commit()
-            await session.refresh(memory)
-
-            return memory
+            except Exception:
+                await session.rollback()
+                logger.exception(
+                    "Failed to save user memory | user=%s",
+                    user_telegram_id,
+                )
+                raise
 
     async def get_user_memories(
         self,
@@ -84,10 +235,9 @@ class MemoryManager:
         limit: int = 15,
     ) -> list[UserMemory]:
 
-        limit = max(1, min(limit, 100))
+        limit = self._safe_limit(limit)
 
         async with SessionFactory() as session:
-
             query = (
                 select(UserMemory)
                 .where(
@@ -96,6 +246,7 @@ class MemoryManager:
                 )
                 .order_by(
                     UserMemory.importance.desc(),
+                    UserMemory.confidence.desc(),
                     UserMemory.updated_at.desc(),
                 )
                 .limit(limit)
@@ -112,12 +263,19 @@ class MemoryManager:
         limit: int = 15,
     ) -> list[UserMemory]:
 
-        limit = max(1, min(limit, 100))
+        limit = self._safe_limit(limit)
+
+        search_text = self._normalize_content(search_text)
+
+        if not search_text:
+            return await self.get_user_memories(
+                user_telegram_id=user_telegram_id,
+                limit=limit,
+            )
 
         search_pattern = f"%{search_text}%"
 
         async with SessionFactory() as session:
-
             query = (
                 select(UserMemory)
                 .where(
@@ -130,6 +288,7 @@ class MemoryManager:
                 )
                 .order_by(
                     UserMemory.importance.desc(),
+                    UserMemory.confidence.desc(),
                     UserMemory.updated_at.desc(),
                 )
                 .limit(limit)
@@ -139,6 +298,104 @@ class MemoryManager:
 
             return list(result.scalars().all())
 
+    # ----------------------------------------------------------
+    # Compatibility alias
+    # ----------------------------------------------------------
+
+    async def search_user_memory(
+        self,
+        user_telegram_id: int,
+        query: str,
+        limit: int = 15,
+    ) -> list[UserMemory]:
+        """
+        Memory Tool / AutoSave ishlatadigan qisqa nom.
+        """
+        return await self.search_user_memories(
+            user_telegram_id=user_telegram_id,
+            search_text=query,
+            limit=limit,
+        )
+
+    async def get_user_memory(
+        self,
+        user_telegram_id: int,
+        memory_id: int,
+    ) -> UserMemory | None:
+
+        async with SessionFactory() as session:
+            query = select(UserMemory).where(
+                UserMemory.id == memory_id,
+                UserMemory.user_telegram_id == user_telegram_id,
+            )
+
+            result = await session.execute(query)
+
+            return result.scalar_one_or_none()
+
+    async def update_user_memory(
+        self,
+        user_telegram_id: int,
+        memory_id: int,
+        *,
+        content: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        importance: Optional[int] = None,
+        confidence: Optional[float] = None,
+    ) -> UserMemory | None:
+
+        async with SessionFactory() as session:
+            try:
+                query = select(UserMemory).where(
+                    UserMemory.id == memory_id,
+                    UserMemory.user_telegram_id == user_telegram_id,
+                )
+
+                result = await session.execute(query)
+                memory = result.scalar_one_or_none()
+
+                if memory is None:
+                    return None
+
+                if content is not None:
+                    normalized = self._normalize_content(content)
+
+                    if not normalized:
+                        raise ValueError(
+                            "Memory content bo‘sh bo‘lishi mumkin emas."
+                        )
+
+                    if self._contains_secret(normalized):
+                        raise ValueError(
+                            "Secret/API key/token/password saqlanmaydi."
+                        )
+
+                    memory.content = normalized
+
+                if memory_type is not None:
+                    memory.memory_type = self._normalize_memory_type(
+                        memory_type
+                    )
+
+                if importance is not None:
+                    memory.importance = self._clamp_importance(
+                        importance
+                    )
+
+                if confidence is not None:
+                    memory.confidence = self._clamp_confidence(
+                        confidence
+                    )
+
+                await session.commit()
+                await session.refresh(memory)
+
+                return memory
+
+            except Exception:
+                await session.rollback()
+                raise
+
     async def forget_user_memory(
         self,
         user_telegram_id: int,
@@ -146,24 +403,57 @@ class MemoryManager:
     ) -> bool:
 
         async with SessionFactory() as session:
+            try:
+                query = select(UserMemory).where(
+                    UserMemory.id == memory_id,
+                    UserMemory.user_telegram_id == user_telegram_id,
+                    UserMemory.active.is_(True),
+                )
 
-            query = select(UserMemory).where(
-                UserMemory.id == memory_id,
-                UserMemory.user_telegram_id == user_telegram_id,
-                UserMemory.active.is_(True),
-            )
+                result = await session.execute(query)
+                memory = result.scalar_one_or_none()
 
-            result = await session.execute(query)
-            memory = result.scalar_one_or_none()
+                if not memory:
+                    return False
 
-            if not memory:
-                return False
+                memory.active = False
 
-            memory.active = False
+                await session.commit()
 
-            await session.commit()
+                return True
 
-            return True
+            except Exception:
+                await session.rollback()
+                raise
+
+    async def restore_user_memory(
+        self,
+        user_telegram_id: int,
+        memory_id: int,
+    ) -> bool:
+
+        async with SessionFactory() as session:
+            try:
+                query = select(UserMemory).where(
+                    UserMemory.id == memory_id,
+                    UserMemory.user_telegram_id == user_telegram_id,
+                )
+
+                result = await session.execute(query)
+                memory = result.scalar_one_or_none()
+
+                if not memory:
+                    return False
+
+                memory.active = True
+
+                await session.commit()
+
+                return True
+
+            except Exception:
+                await session.rollback()
+                raise
 
     async def clear_user_memories(
         self,
@@ -171,16 +461,20 @@ class MemoryManager:
     ) -> int:
 
         async with SessionFactory() as session:
+            try:
+                query = delete(UserMemory).where(
+                    UserMemory.user_telegram_id == user_telegram_id
+                )
 
-            query = delete(UserMemory).where(
-                UserMemory.user_telegram_id == user_telegram_id
-            )
+                result = await session.execute(query)
 
-            result = await session.execute(query)
+                await session.commit()
 
-            await session.commit()
+                return result.rowcount or 0
 
-            return result.rowcount or 0
+            except Exception:
+                await session.rollback()
+                raise
 
     async def user_memory_count(
         self,
@@ -188,7 +482,6 @@ class MemoryManager:
     ) -> int:
 
         async with SessionFactory() as session:
-
             query = select(
                 func.count(UserMemory.id)
             ).where(
@@ -199,6 +492,18 @@ class MemoryManager:
             result = await session.execute(query)
 
             return int(result.scalar_one())
+
+    # ----------------------------------------------------------
+    # Compatibility alias
+    # ----------------------------------------------------------
+
+    async def count_user_memory(
+        self,
+        user_telegram_id: int,
+    ) -> int:
+        return await self.user_memory_count(
+            user_telegram_id=user_telegram_id
+        )
 
     # ==========================================================
     # GROUP MEMORY
@@ -214,53 +519,102 @@ class MemoryManager:
         source_message_id: Optional[int] = None,
     ) -> GroupMemory:
 
-        importance = max(0, min(100, importance))
-        confidence = max(0.0, min(1.0, confidence))
+        content = self._normalize_content(content)
+        memory_type = self._normalize_memory_type(memory_type)
+        importance = self._clamp_importance(importance)
+        confidence = self._clamp_confidence(confidence)
+
+        if not content:
+            raise ValueError("Group memory content bo‘sh bo‘lishi mumkin emas.")
+
+        if self._contains_secret(content):
+            raise ValueError(
+                "Secret/API key/token/password group memory'ga saqlanmaydi."
+            )
 
         async with SessionFactory() as session:
-
-            existing_query = select(GroupMemory).where(
-                GroupMemory.group_telegram_id == group_telegram_id,
-                GroupMemory.content == content,
-                GroupMemory.active.is_(True),
-            )
-
-            result = await session.execute(existing_query)
-            existing = result.scalar_one_or_none()
-
-            if existing:
-
-                existing.importance = max(
-                    existing.importance,
-                    importance,
+            try:
+                query = select(GroupMemory).where(
+                    GroupMemory.group_telegram_id == group_telegram_id,
+                    GroupMemory.content == content,
+                    GroupMemory.active.is_(True),
                 )
 
-                existing.confidence = max(
-                    existing.confidence,
-                    confidence,
+                result = await session.execute(query)
+                existing = result.scalar_one_or_none()
+
+                if existing:
+                    existing.importance = max(
+                        existing.importance,
+                        importance,
+                    )
+
+                    existing.confidence = max(
+                        existing.confidence,
+                        confidence,
+                    )
+
+                    if source_message_id is not None:
+                        existing.source_message_id = source_message_id
+
+                    await session.commit()
+                    await session.refresh(existing)
+
+                    return existing
+
+                inactive_query = select(GroupMemory).where(
+                    GroupMemory.group_telegram_id == group_telegram_id,
+                    GroupMemory.content == content,
+                    GroupMemory.active.is_(False),
                 )
+
+                result = await session.execute(inactive_query)
+                inactive = result.scalar_one_or_none()
+
+                if inactive:
+                    inactive.active = True
+                    inactive.memory_type = memory_type
+                    inactive.importance = importance
+                    inactive.confidence = confidence
+
+                    if source_message_id is not None:
+                        inactive.source_message_id = source_message_id
+
+                    await session.commit()
+                    await session.refresh(inactive)
+
+                    return inactive
+
+                memory = GroupMemory(
+                    group_telegram_id=group_telegram_id,
+                    memory_type=memory_type,
+                    content=content,
+                    importance=importance,
+                    confidence=confidence,
+                    source_message_id=source_message_id,
+                    active=True,
+                )
+
+                session.add(memory)
 
                 await session.commit()
-                await session.refresh(existing)
+                await session.refresh(memory)
 
-                return existing
+                logger.debug(
+                    "Group memory saved | group=%s | type=%s",
+                    group_telegram_id,
+                    memory_type,
+                )
 
-            memory = GroupMemory(
-                group_telegram_id=group_telegram_id,
-                memory_type=memory_type,
-                content=content,
-                importance=importance,
-                confidence=confidence,
-                source_message_id=source_message_id,
-                active=True,
-            )
+                return memory
 
-            session.add(memory)
-
-            await session.commit()
-            await session.refresh(memory)
-
-            return memory
+            except Exception:
+                await session.rollback()
+                logger.exception(
+                    "Failed to save group memory | group=%s",
+                    group_telegram_id,
+                )
+                raise
 
     async def get_group_memories(
         self,
@@ -268,10 +622,9 @@ class MemoryManager:
         limit: int = 15,
     ) -> list[GroupMemory]:
 
-        limit = max(1, min(limit, 100))
+        limit = self._safe_limit(limit)
 
         async with SessionFactory() as session:
-
             query = (
                 select(GroupMemory)
                 .where(
@@ -280,6 +633,7 @@ class MemoryManager:
                 )
                 .order_by(
                     GroupMemory.importance.desc(),
+                    GroupMemory.confidence.desc(),
                     GroupMemory.updated_at.desc(),
                 )
                 .limit(limit)
@@ -296,105 +650,19 @@ class MemoryManager:
         limit: int = 15,
     ) -> list[GroupMemory]:
 
-        limit = max(1, min(limit, 100))
+        limit = self._safe_limit(limit)
+
+        search_text = self._normalize_content(search_text)
+
+        if not search_text:
+            return await self.get_group_memories(
+                group_telegram_id=group_telegram_id,
+                limit=limit,
+            )
 
         search_pattern = f"%{search_text}%"
 
         async with SessionFactory() as session:
-
             query = (
                 select(GroupMemory)
-                .where(
-                    GroupMemory.group_telegram_id == group_telegram_id,
-                    GroupMemory.active.is_(True),
-                    or_(
-                        GroupMemory.content.ilike(search_pattern),
-                        GroupMemory.memory_type.ilike(search_pattern),
-                    ),
-                )
-                .order_by(
-                    GroupMemory.importance.desc(),
-                    GroupMemory.updated_at.desc(),
-                )
-                .limit(limit)
-            )
-
-            result = await session.execute(query)
-
-            return list(result.scalars().all())
-
-    async def clear_group_memories(
-        self,
-        group_telegram_id: int,
-    ) -> int:
-
-        async with SessionFactory() as session:
-
-            query = delete(GroupMemory).where(
-                GroupMemory.group_telegram_id == group_telegram_id
-            )
-
-            result = await session.execute(query)
-
-            await session.commit()
-
-            return result.rowcount or 0
-
-    # ==========================================================
-    # CONTEXT BUILDER
-    # ==========================================================
-
-    async def build_user_memory_context(
-        self,
-        user_telegram_id: int,
-        limit: int = 15,
-    ) -> str:
-
-        memories = await self.get_user_memories(
-            user_telegram_id,
-            limit,
-        )
-
-        if not memories:
-            return "User haqida saqlangan xotira mavjud emas."
-
-        lines = []
-
-        for memory in memories:
-            lines.append(
-                f"- [{memory.memory_type}] "
-                f"{memory.content} "
-                f"(importance={memory.importance}, "
-                f"confidence={memory.confidence:.2f})"
-            )
-
-        return "\n".join(lines)
-
-    async def build_group_memory_context(
-        self,
-        group_telegram_id: int,
-        limit: int = 15,
-    ) -> str:
-
-        memories = await self.get_group_memories(
-            group_telegram_id,
-            limit,
-        )
-
-        if not memories:
-            return "Guruh haqida saqlangan xotira mavjud emas."
-
-        lines = []
-
-        for memory in memories:
-            lines.append(
-                f"- [{memory.memory_type}] "
-                f"{memory.content} "
-                f"(importance={memory.importance}, "
-                f"confidence={memory.confidence:.2f})"
-            )
-
-        return "\n".join(lines)
-
-
-memory_manager = MemoryManager()
+              
