@@ -1,0 +1,1099 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from aiogram import Bot, Router
+from aiogram.enums import ChatType
+from aiogram.types import Message
+
+from app.agent.bot_interaction import bot_interaction
+from app.agent.telegram_bridge import process_group_message
+from app.services.message_service import message_service
+from app.services.user_service import user_service
+
+logger = logging.getLogger("sara.bot.groups")
+
+router = Router(name="groups")
+
+
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+
+def _get_text(message: Message) -> str:
+    """
+    Telegram xabaridan asosiy matnni oladi.
+
+    text:
+        Oddiy text message.
+
+    caption:
+        Photo/document kabi media xabarlaridagi caption.
+    """
+
+    return (
+        message.text
+        or message.caption
+        or ""
+    ).strip()
+
+
+# ============================================================
+# SARA ID / USERNAME
+# ============================================================
+
+async def _get_sara_identity(
+    bot: Bot,
+) -> tuple[int, str]:
+    """
+    SARA botining Telegram ID va username'ini qaytaradi.
+
+    Returns:
+        (sara_id, sara_username)
+    """
+
+    me = await bot.get_me()
+
+    return (
+        int(me.id),
+        str(me.username or ""),
+    )
+
+
+# ============================================================
+# BOT CHECK
+# ============================================================
+
+def _is_bot_message(
+    message: Message,
+) -> bool:
+    """
+    Xabar yuboruvchisi botmi?
+    """
+
+    if message.from_user is None:
+        return False
+
+    return bool(
+        message.from_user.is_bot
+    )
+
+
+# ============================================================
+# SARA MENTION
+# ============================================================
+
+def _contains_sara_mention(
+    message: Message,
+    sara_username: str | None,
+) -> bool:
+    """
+    Xabarda SARA chaqirilganini aniqlaydi.
+
+    Qo'llab-quvvatlanadi:
+
+        sara
+        SARA
+        sára
+        Сара
+        @sara_username
+
+    Telegram mention entity ham tekshiriladi.
+    """
+
+    text = _get_text(message)
+
+    if not text:
+        return False
+
+    lowered = text.lower()
+
+    # --------------------------------------------------------
+    # Direct name calls
+    # --------------------------------------------------------
+
+    direct_words = (
+        "sara",
+        "sára",
+        "сара",
+    )
+
+    for word in direct_words:
+        if word in lowered:
+            return True
+
+    # --------------------------------------------------------
+    # @username
+    # --------------------------------------------------------
+
+    if sara_username:
+        username = (
+            sara_username
+            .lower()
+            .lstrip("@")
+        )
+
+        if username:
+            if f"@{username}" in lowered:
+                return True
+
+    # --------------------------------------------------------
+    # Telegram entities
+    # --------------------------------------------------------
+
+    if message.entities:
+        for entity in message.entities:
+
+            if entity.type != "mention":
+                continue
+
+            try:
+                value = text[
+                    entity.offset:
+                    entity.offset + entity.length
+                ]
+
+                if not sara_username:
+                    continue
+
+                normalized_value = (
+                    value
+                    .lstrip("@")
+                    .lower()
+                )
+
+                normalized_username = (
+                    sara_username
+                    .lstrip("@")
+                    .lower()
+                )
+
+                if (
+                    normalized_value
+                    == normalized_username
+                ):
+                    return True
+
+            except Exception:
+                logger.exception(
+                    "Telegram mention entity tekshirishda xato."
+                )
+
+    return False
+
+
+# ============================================================
+# REPLY TO SARA
+# ============================================================
+
+def _is_reply_to_sara(
+    message: Message,
+    sara_id: int,
+) -> bool:
+    """
+    Xabar SARA xabariga reply qilinganmi?
+    """
+
+    reply = message.reply_to_message
+
+    if reply is None:
+        return False
+
+    if reply.from_user is None:
+        return False
+
+    try:
+        return (
+            int(reply.from_user.id)
+            == int(sara_id)
+        )
+    except Exception:
+        return False
+
+
+# ============================================================
+# REPLY TO OTHER BOT
+# ============================================================
+
+def _is_reply_to_other_bot(
+    message: Message,
+    sara_id: int,
+) -> bool:
+    """
+    Xabar boshqa bot xabariga reply qilinganmi?
+
+    SARA'ning o'z xabari bu yerda other bot hisoblanmaydi.
+    """
+
+    reply = message.reply_to_message
+
+    if reply is None:
+        return False
+
+    if reply.from_user is None:
+        return False
+
+    if not reply.from_user.is_bot:
+        return False
+
+    try:
+        return (
+            int(reply.from_user.id)
+            != int(sara_id)
+        )
+    except Exception:
+        return False
+
+
+# ============================================================
+# BOT CHAIN DEPTH
+# ============================================================
+
+def _get_bot_chain_depth(
+    message: Message,
+    *,
+    max_depth: int = 20,
+) -> int:
+    """
+    Reply chain ichidagi botlar sonini hisoblaydi.
+
+    Masalan:
+
+        BotA
+          ↓
+        SARA
+          ↓
+        BotA
+          ↓
+        SARA
+
+    chain depth oshib boradi.
+
+    max_depth:
+        Himoya uchun maksimal traversal.
+    """
+
+    depth = 0
+
+    current = message.reply_to_message
+
+    visited_messages: set[int] = set()
+
+    while current is not None:
+
+        # ----------------------------------------------------
+        # Circular reply protection
+        # ----------------------------------------------------
+
+        try:
+            current_message_id = int(
+                current.message_id
+            )
+        except Exception:
+            current_message_id = 0
+
+        if current_message_id:
+
+            if current_message_id in visited_messages:
+                break
+
+            visited_messages.add(
+                current_message_id
+            )
+
+        # ----------------------------------------------------
+        # Bot count
+        # ----------------------------------------------------
+
+        if current.from_user is not None:
+            if current.from_user.is_bot:
+                depth += 1
+
+        if depth >= max_depth:
+            break
+
+        current = current.reply_to_message
+
+    return depth
+
+
+# ============================================================
+# SAVE USER / BOT
+# ============================================================
+
+async def _save_sender(
+    message: Message,
+    *,
+    sender_id: int,
+    sender_is_bot: bool,
+) -> None:
+    """
+    Telegram senderini User jadvaliga saqlaydi.
+    """
+
+    if message.from_user is None:
+        return
+
+    try:
+        await user_service.get_or_create_user(
+            telegram_id=sender_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            language_code=message.from_user.language_code,
+            is_bot=sender_is_bot,
+        )
+
+    except Exception:
+        logger.exception(
+            "Group user DB update failed | "
+            "chat=%s user=%s",
+            message.chat.id,
+            sender_id,
+        )
+
+
+# ============================================================
+# SAVE INCOMING MESSAGE
+# ============================================================
+
+async def _save_incoming_message(
+    message: Message,
+    *,
+    chat_id: int,
+    sender_id: int,
+    sender_is_bot: bool,
+    text: str,
+) -> None:
+    """
+    Guruhdagi incoming message'ni DB'ga saqlaydi.
+    """
+
+    try:
+        await message_service.save_message(
+            telegram_message_id=(
+                message.message_id
+            ),
+            chat_id=chat_id,
+            user_telegram_id=sender_id,
+            role=(
+                "assistant"
+                if sender_is_bot
+                else "user"
+            ),
+            content=text,
+            message_type="text",
+            reply_to_message_id=(
+                message.reply_to_message.message_id
+                if message.reply_to_message
+                else None
+            ),
+            is_bot_message=sender_is_bot,
+        )
+
+    except Exception:
+        logger.exception(
+            "Group message save failed | "
+            "chat=%s user=%s",
+            chat_id,
+            sender_id,
+        )
+
+
+# ============================================================
+# SAVE SARA RESPONSE
+# ============================================================
+
+async def _save_sara_response(
+    *,
+    sent_message: Message,
+    chat_id: int,
+    sara_id: int,
+    response_text: str,
+    source_message_id: int,
+) -> None:
+    """
+    SARA yuborgan javobni DB'ga saqlaydi.
+    """
+
+    try:
+        await message_service.save_message(
+            telegram_message_id=(
+                sent_message.message_id
+            ),
+            chat_id=chat_id,
+            user_telegram_id=sara_id,
+            role="assistant",
+            content=response_text,
+            message_type="text",
+            reply_to_message_id=source_message_id,
+            is_bot_message=True,
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not save SARA group response | "
+            "chat=%s",
+            chat_id,
+        )
+
+
+# ============================================================
+# EXECUTION SENT CHECK
+# ============================================================
+
+def _execution_already_sent(
+    result: Any,
+) -> bool:
+    """
+    Executor Telegram tool orqali javobni allaqachon
+    yuborgan bo'lsa True qaytaradi.
+
+    Bu double-send muammosini oldini oladi.
+    """
+
+    execution = getattr(
+        result,
+        "execution",
+        None,
+    )
+
+    if execution is None:
+        return False
+
+    metadata = getattr(
+        execution,
+        "metadata",
+        None,
+    )
+
+    if not isinstance(
+        metadata,
+        dict,
+    ):
+        return False
+
+    return bool(
+        metadata.get(
+            "telegram_sent",
+            False,
+        )
+    )
+
+
+# ============================================================
+# GROUP HANDLER
+# ============================================================
+
+@router.message()
+async def group_message_handler(
+    message: Message,
+    bot: Bot,
+) -> None:
+
+    # ========================================================
+    # ONLY GROUPS
+    # ========================================================
+
+    if message.chat.type not in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }:
+        return
+
+    # ========================================================
+    # SENDER
+    # ========================================================
+
+    if message.from_user is None:
+        return
+
+    text = _get_text(message)
+
+    if not text:
+        return
+
+    chat_id = int(
+        message.chat.id
+    )
+
+    sender_id = int(
+        message.from_user.id
+    )
+
+    sender_is_bot = _is_bot_message(
+        message
+    )
+
+    # ========================================================
+    # SARA IDENTITY
+    # ========================================================
+
+    try:
+        sara_id, sara_username = (
+            await _get_sara_identity(bot)
+        )
+
+    except Exception:
+        logger.exception(
+            "SARA bot identity olishda xato."
+        )
+        return
+
+    # ========================================================
+    # NEVER PROCESS SARA'S OWN MESSAGE
+    # ========================================================
+
+    if sender_id == sara_id:
+        return
+
+    # ========================================================
+    # BASIC MESSAGE FLAGS
+    # ========================================================
+
+    sara_mentioned = (
+        _contains_sara_mention(
+            message,
+            sara_username,
+        )
+    )
+
+    reply_to_sara = (
+        _is_reply_to_sara(
+            message,
+            sara_id,
+        )
+    )
+
+    reply_to_other_bot = (
+        _is_reply_to_other_bot(
+            message,
+            sara_id,
+        )
+    )
+
+    bot_chain_depth = (
+        _get_bot_chain_depth(
+            message
+        )
+    )
+
+    # ========================================================
+    # BOT ↔ BOT INTERACTION
+    # ========================================================
+
+    bot_conversation_continuation = False
+
+    if sender_is_bot:
+
+        # ----------------------------------------------------
+        # Bot-to-bot feature disabled
+        # ----------------------------------------------------
+
+        if not bot_interaction.enabled:
+            logger.debug(
+                "Bot-to-bot disabled | "
+                "chat=%s bot=%s",
+                chat_id,
+                sender_id,
+            )
+            return
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # should_process() ni register_incoming_bot() DAN
+        # OLDIN chaqiramiz.
+        #
+        # Chunki register_incoming_bot() last_activity ni
+        # yangilaydi va cooldown noto'g'ri ishga tushishi mumkin.
+        # ----------------------------------------------------
+
+        allowed = (
+            bot_interaction.should_process(
+                message,
+                sara_username=sara_username,
+                sara_id=sara_id,
+            )
+        )
+
+        if not allowed:
+
+            logger.info(
+                "Bot message rejected by BotInteractionManager | "
+                "chat=%s bot=%s",
+                chat_id,
+                sender_id,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Existing multi-turn conversation?
+        # ----------------------------------------------------
+
+        bot_conversation_continuation = (
+            bot_interaction.has_conversation(
+                chat_id=chat_id,
+                bot_id=sender_id,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Register incoming bot message
+        # ----------------------------------------------------
+
+        try:
+            bot_interaction.register_incoming_bot(
+                message
+            )
+
+        except Exception:
+            logger.exception(
+                "Incoming bot message registration failed | "
+                "chat=%s bot=%s",
+                chat_id,
+                sender_id,
+            )
+
+        logger.info(
+            "Bot-to-bot message accepted | "
+            "chat=%s bot=%s | "
+            "mention=%s reply_to_sara=%s continuation=%s "
+            "depth=%s",
+            chat_id,
+            sender_id,
+            sara_mentioned,
+            reply_to_sara,
+            bot_conversation_continuation,
+            bot_chain_depth,
+        )
+
+    else:
+
+        # ====================================================
+        # HUMAN MESSAGE
+        # ====================================================
+
+        # Yangi user message bot-to-bot chainni reset qiladi.
+        try:
+            bot_interaction.register_user_message(
+                chat_id
+            )
+        except Exception:
+            logger.exception(
+                "Bot interaction user-message reset failed | "
+                "chat=%s user=%s",
+                chat_id,
+                sender_id,
+            )
+
+    # ========================================================
+    # USER / BOT DB PROFILE
+    # ========================================================
+
+    await _save_sender(
+        message,
+        sender_id=sender_id,
+        sender_is_bot=sender_is_bot,
+    )
+
+    # ========================================================
+    # SAVE INCOMING MESSAGE
+    # ========================================================
+
+    await _save_incoming_message(
+        message,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        sender_is_bot=sender_is_bot,
+        text=text,
+    )
+
+    # ========================================================
+    # SHOULD SARA BE CONSIDERED CALLED?
+    # ========================================================
+
+    # Oddiy user:
+    #
+    #   sara_called = mention OR reply
+    #
+    # Bot:
+    #
+    #   explicit mention/reply
+    #   OR mavjud multi-turn bot conversation.
+    #
+    # Shu orqali BotA birinchi marta SARA'ni chaqiradi,
+    # keyingi xabarlarda esa conversation davom etadi.
+    # ========================================================
+
+    effective_sara_called = (
+        sara_mentioned
+        or reply_to_sara
+        or bot_conversation_continuation
+    )
+
+    # ========================================================
+    # AGENT FLAGS
+    # ========================================================
+
+    extra_flags: dict[str, Any] = {
+
+        # ----------------------------------------------------
+        # Source
+        # ----------------------------------------------------
+
+        "source":
+            "group_handler",
+
+        "source_message_id":
+            message.message_id,
+
+        # ----------------------------------------------------
+        # Telegram identity
+        # ----------------------------------------------------
+
+        "chat_id":
+            chat_id,
+
+        "user_id":
+            sender_id,
+
+        # ----------------------------------------------------
+        # Chat type
+        # ----------------------------------------------------
+
+        "is_group":
+            True,
+
+        "is_private":
+            False,
+
+        # ----------------------------------------------------
+        # Sender
+        # ----------------------------------------------------
+
+        "is_bot":
+            sender_is_bot,
+
+        "is_bot_message":
+            sender_is_bot,
+
+        # ----------------------------------------------------
+        # Bot interaction
+        # ----------------------------------------------------
+
+        "allow_bot_interaction":
+            (
+                bot_interaction.enabled
+                if sender_is_bot
+                else True
+            ),
+
+        "bot_to_bot":
+            sender_is_bot,
+
+        "bot_conversation_continuation":
+            bot_conversation_continuation,
+
+        "bot_chain_depth":
+            bot_chain_depth,
+
+        "max_bot_chain":
+            bot_interaction.max_chain,
+
+        "reply_to_other_bot":
+            reply_to_other_bot,
+
+        # ----------------------------------------------------
+        # SARA
+        # ----------------------------------------------------
+
+        "sara_username":
+            sara_username,
+
+        "sara_id":
+            sara_id,
+
+        "sara_mentioned":
+            sara_mentioned,
+
+        "reply_to_sara":
+            reply_to_sara,
+
+        # ----------------------------------------------------
+        # Memory
+        # ----------------------------------------------------
+
+        # Bot o'zining "user memory"ini SARA user memory
+        # sifatida saqlamasin.
+        "allow_user_memory":
+            not sender_is_bot,
+
+        "allow_group_memory":
+            True,
+
+        "allow_conversation_memory":
+            True,
+
+        "remember_context":
+            True,
+
+        "memory_scope":
+            (
+                "group_bot_conversation"
+                if sender_is_bot
+                else "user_group_conversation"
+            ),
+
+        # ----------------------------------------------------
+        # Tools
+        # ----------------------------------------------------
+
+        "allow_telegram_tools":
+            True,
+
+        "allow_reminders":
+            not sender_is_bot,
+
+        "allow_memory_tools":
+            True,
+
+        "allow_media_tools":
+            True,
+
+        # ----------------------------------------------------
+        # Group
+        # ----------------------------------------------------
+
+        "group_id":
+            chat_id,
+    }
+
+    # ========================================================
+    # PROCESS THROUGH SARA AGENT
+    # ========================================================
+
+    try:
+
+        result = await process_group_message(
+            message,
+            text=text,
+
+            sara_called=(
+                effective_sara_called
+            ),
+
+            is_reply_to_sara=(
+                reply_to_sara
+            ),
+
+            extra_flags=extra_flags,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "SARA group Agent failed | "
+            "chat=%s user=%s bot=%s",
+            chat_id,
+            sender_id,
+            sender_is_bot,
+        )
+
+        return
+
+    # ========================================================
+    # RESULT VALIDATION
+    # ========================================================
+
+    if not result:
+        logger.debug(
+            "Group Agent returned empty result | "
+            "chat=%s",
+            chat_id,
+        )
+        return
+
+    # ========================================================
+    # AGENT FAILURE
+    # ========================================================
+
+    if not getattr(
+        result,
+        "success",
+        False,
+    ):
+
+        logger.warning(
+            "Group Agent failure | "
+            "chat=%s user=%s bot=%s error=%s",
+            chat_id,
+            sender_id,
+            sender_is_bot,
+            getattr(
+                result,
+                "error",
+                None,
+            ),
+        )
+
+        return
+
+    # ========================================================
+    # SHOULD SEND?
+    # ========================================================
+
+    if not getattr(
+        result,
+        "should_send",
+        False,
+    ):
+
+        logger.debug(
+            "SARA decided not to send | "
+            "chat=%s user=%s bot=%s",
+            chat_id,
+            sender_id,
+            sender_is_bot,
+        )
+
+        return
+
+    # ========================================================
+    # RESPONSE TEXT
+    # ========================================================
+
+    response_text = (
+        getattr(
+            result,
+            "response_text",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not response_text:
+        logger.warning(
+            "SARA response text empty | "
+            "chat=%s",
+            chat_id,
+        )
+        return
+
+    # ========================================================
+    # DUPLICATE SEND PROTECTION
+    # ========================================================
+
+    if _execution_already_sent(result):
+
+        logger.info(
+            "SARA response already sent by executor | "
+            "chat=%s",
+            chat_id,
+        )
+
+        # Bot conversation state ham yangilanadi.
+        if sender_is_bot:
+            try:
+                bot_interaction.register_response(
+                    chat_id=chat_id,
+                    bot_id=sender_id,
+                    response_text=response_text,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not register executor-sent bot response | "
+                    "chat=%s bot=%s",
+                    chat_id,
+                    sender_id,
+                )
+
+        return
+
+    # ========================================================
+    # SEND SARA RESPONSE
+    # ========================================================
+
+    try:
+
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=response_text,
+
+            # SARA har doim source message'ga reply qiladi.
+            reply_to_message_id=(
+                message.message_id
+            ),
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Could not send SARA group response | "
+            "chat=%s source=%s",
+            chat_id,
+            message.message_id,
+        )
+
+        return
+
+    # ========================================================
+    # REGISTER BOT-TO-BOT RESPONSE
+    # ========================================================
+
+    if sender_is_bot:
+
+        try:
+
+            bot_interaction.register_response(
+                chat_id=chat_id,
+                bot_id=sender_id,
+                response_text=response_text,
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not register SARA bot response | "
+                "chat=%s bot=%s",
+                chat_id,
+                sender_id,
+            )
+
+    # ========================================================
+    # SAVE SARA RESPONSE
+    # ========================================================
+
+    await _save_sara_response(
+        sent_message=sent,
+        chat_id=chat_id,
+        sara_id=sara_id,
+        response_text=response_text,
+        source_message_id=message.message_id,
+    )
+
+    # ========================================================
+    # LOG
+    # ========================================================
+
+    logger.info(
+        "SARA group response sent | "
+        "chat=%s | source=%s | source_is_bot=%s | "
+        "sara_message=%s | bot_conversation=%s",
+        chat_id,
+        sender_id,
+        sender_is_bot,
+        sent.message_id,
+        sender_is_bot,
+    )
+
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+__all__ = [
+    "router",
+]
