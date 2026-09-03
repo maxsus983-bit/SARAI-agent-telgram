@@ -1,0 +1,1189 @@
+from __future__ import annotations
+
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from aiogram.types import Message
+
+from app.agent.loop_guard import loop_guard
+from app.config.settings import settings
+
+
+logger = logging.getLogger("sara.agent.bot_interaction")
+
+
+# ================================================================
+# BOT MESSAGE DETECTION
+# ================================================================
+
+
+def is_bot_message(message: Message) -> bool:
+    """
+    Telegram xabari botdan kelganligini aniqlaydi.
+    """
+
+    return bool(
+        message.from_user
+        and message.from_user.is_bot
+    )
+
+
+def get_bot_id(
+    message: Message,
+) -> int | None:
+    """
+    Xabar yuborgan bot Telegram ID'sini qaytaradi.
+    """
+
+    if not message.from_user:
+        return None
+
+    if not message.from_user.is_bot:
+        return None
+
+    return int(
+        message.from_user.id
+    )
+
+
+def get_bot_username(
+    message: Message,
+) -> str | None:
+    """
+    Bot username'ini xavfsiz qaytaradi.
+    """
+
+    if not message.from_user:
+        return None
+
+    if not message.from_user.is_bot:
+        return None
+
+    username = message.from_user.username
+
+    if not username:
+        return None
+
+    return username.strip().lstrip("@").lower()
+
+
+# ================================================================
+# TEXT HELPERS
+# ================================================================
+
+
+def get_message_text(
+    message: Message,
+) -> str:
+    """
+    Text yoki captionni qaytaradi.
+    """
+
+    return (
+        message.text
+        or message.caption
+        or ""
+    ).strip()
+
+
+def normalize_username(
+    username: str | None,
+) -> str:
+    if not username:
+        return ""
+
+    return (
+        username
+        .strip()
+        .lstrip("@")
+        .lower()
+    )
+
+
+def bot_was_explicitly_called(
+    message: Message,
+    bot_username: str | None,
+) -> bool:
+    """
+    Bot SARA'ni bevosita chaqirganmi?
+
+    Quyidagilar tan olinadi:
+
+        @sara
+        sara
+        SARA
+        /sara
+    """
+
+    text = get_message_text(
+        message
+    )
+
+    if not text:
+        return False
+
+    text_lower = text.lower()
+
+    username = normalize_username(
+        bot_username
+    )
+
+    # ------------------------------------------------------------
+    # @username
+    # ------------------------------------------------------------
+
+    if username:
+
+        pattern = rf"@{re.escape(username)}(?:\b|$)"
+
+        if re.search(
+            pattern,
+            text_lower,
+        ):
+            return True
+
+    # ------------------------------------------------------------
+    # SARA nomi
+    # ------------------------------------------------------------
+
+    if re.search(
+        r"\bsara\b",
+        text_lower,
+    ):
+        return True
+
+    # ------------------------------------------------------------
+    # /sara command
+    # ------------------------------------------------------------
+
+    if re.search(
+        r"^/sara(?:@\w+)?(?:\s|$)",
+        text_lower,
+    ):
+        return True
+
+    return False
+
+
+# ================================================================
+# REPLY DETECTION
+# ================================================================
+
+
+def is_reply_to_message(
+    message: Message,
+) -> bool:
+    return bool(
+        message.reply_to_message
+    )
+
+
+def is_reply_to_sara(
+    message: Message,
+    sara_id: int | None = None,
+    sara_username: str | None = None,
+) -> bool:
+
+    reply = message.reply_to_message
+
+    if reply is None:
+        return False
+
+    replied_user = reply.from_user
+
+    if replied_user is None:
+        return False
+
+    # ------------------------------------------------------------
+    # SARA Telegram ID
+    # ------------------------------------------------------------
+
+    if (
+        sara_id is not None
+        and replied_user.id == sara_id
+    ):
+        return True
+
+    # ------------------------------------------------------------
+    # SARA username
+    # ------------------------------------------------------------
+
+    username = normalize_username(
+        sara_username
+    )
+
+    if username:
+
+        replied_username = normalize_username(
+            replied_user.username
+        )
+
+        if (
+            replied_username
+            and replied_username == username
+        ):
+            return True
+
+    return False
+
+
+def is_reply_to_other_bot(
+    message: Message,
+    sara_id: int | None = None,
+) -> bool:
+
+    reply = message.reply_to_message
+
+    if reply is None:
+        return False
+
+    replied_user = reply.from_user
+
+    if replied_user is None:
+        return False
+
+    if not replied_user.is_bot:
+        return False
+
+    # SARA'ning o'ziga reply bo'lsa,
+    # boshqa bot deb hisoblamaymiz.
+    if (
+        sara_id is not None
+        and replied_user.id == sara_id
+    ):
+        return False
+
+    return True
+
+
+# ================================================================
+# BOT CONVERSATION STATE
+# ================================================================
+
+
+@dataclass
+class BotConversationState:
+    """
+    Bitta chat ichidagi SARA ↔ boshqa bot
+    suhbatining vaqtinchalik holati.
+    """
+
+    chat_id: int
+
+    bot_id: int
+
+    bot_username: str | None = None
+
+    started_at: float = field(
+        default_factory=time.monotonic
+    )
+
+    last_activity: float = field(
+        default_factory=time.monotonic
+    )
+
+    turns: int = 0
+
+    incoming_messages: int = 0
+
+    sara_responses: int = 0
+
+    active: bool = False
+
+    last_message_id: int | None = None
+
+    last_bot_message: str = ""
+
+    last_sara_response: str = ""
+
+    def touch(
+        self,
+    ) -> None:
+        self.last_activity = (
+            time.monotonic()
+        )
+
+
+# ================================================================
+# BOT INTERACTION MANAGER
+# ================================================================
+
+
+class BotInteractionManager:
+    """
+    SARA'ning boshqa Telegram botlari bilan
+    ishlashini boshqaradi.
+
+    Vazifalari:
+
+        🤖 Botni aniqlash
+        🎯 SARA chaqirilganini aniqlash
+        ↩️ Reply orqali suhbatni davom ettirish
+        🔁 Multi-turn holat
+        🛑 Loop protection
+        ⏱ Cooldown
+        🧹 Eski conversation state'larni tozalash
+        📊 Statistikalar
+    """
+
+    def __init__(self) -> None:
+
+        self._conversations: dict[
+            tuple[int, int],
+            BotConversationState,
+        ] = {}
+
+        self._processed_messages = 0
+
+        self._accepted_messages = 0
+
+        self._blocked_messages = 0
+
+        self._responses = 0
+
+        self._created_conversations = 0
+
+    # ============================================================
+    # CONFIG
+    # ============================================================
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            settings.bot_to_bot_mode
+        )
+
+    @property
+    def max_chain(self) -> int:
+        try:
+            value = int(
+                settings.max_bot_chain
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            value = 5
+
+        return max(
+            1,
+            value,
+        )
+
+    @property
+    def cooldown_seconds(self) -> float:
+        try:
+            value = float(
+                settings.bot_to_bot_cooldown_seconds
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            value = 30.0
+
+        return max(
+            0.0,
+            value,
+        )
+
+    # ============================================================
+    # SHOULD PROCESS
+    # ============================================================
+
+    def should_process(
+        self,
+        *,
+        message: Message,
+        sara_username: str | None = None,
+        sara_id: int | None = None,
+    ) -> bool:
+        """
+        Bot xabarini SARA qayta ishlashi kerakmi?
+
+        Qabul qilinadigan holatlar:
+
+        1. Bot @SARA deb chaqirdi.
+        2. Bot SARA xabariga reply qildi.
+        3. Avval boshlangan SARA ↔ bot conversation mavjud
+           va bot yangi javob yubordi.
+
+        Infinite loop uchun loop_guard ishlatiladi.
+        """
+
+        self._processed_messages += 1
+
+        # --------------------------------------------------------
+        # GLOBAL DISABLE
+        # --------------------------------------------------------
+
+        if not self.enabled:
+
+            self._blocked_messages += 1
+
+            return False
+
+        # --------------------------------------------------------
+        # ONLY BOT
+        # --------------------------------------------------------
+
+        if not is_bot_message(
+            message
+        ):
+
+            return False
+
+        # --------------------------------------------------------
+        # SARA O'ZINI QAYTA ISHLAMAYDI
+        # --------------------------------------------------------
+
+        bot_id = get_bot_id(
+            message
+        )
+
+        if (
+            bot_id is not None
+            and sara_id is not None
+            and bot_id == sara_id
+        ):
+
+            self._blocked_messages += 1
+
+            return False
+
+        # --------------------------------------------------------
+        # CLEANUP
+        # --------------------------------------------------------
+
+        self.cleanup()
+
+        chat_id = int(
+            message.chat.id
+        )
+
+        # --------------------------------------------------------
+        # EXPLICIT CALL
+        # --------------------------------------------------------
+
+        explicitly_called = (
+            bot_was_explicitly_called(
+                message,
+                sara_username,
+            )
+        )
+
+        # --------------------------------------------------------
+        # REPLY TO SARA
+        # --------------------------------------------------------
+
+        replied_to_sara = (
+            is_reply_to_sara(
+                message,
+                sara_id=sara_id,
+                sara_username=sara_username,
+            )
+        )
+
+        # --------------------------------------------------------
+        # EXISTING CONVERSATION
+        # --------------------------------------------------------
+
+        conversation_exists = False
+
+        if bot_id is not None:
+
+            conversation_exists = (
+                self.has_conversation(
+                    chat_id=chat_id,
+                    bot_id=bot_id,
+                )
+            )
+
+        # --------------------------------------------------------
+        # NO TRIGGER
+        # --------------------------------------------------------
+
+        if not (
+            explicitly_called
+            or replied_to_sara
+            or conversation_exists
+        ):
+
+            self._blocked_messages += 1
+
+            return False
+
+        # --------------------------------------------------------
+        # LOOP GUARD
+        # --------------------------------------------------------
+
+        if not loop_guard.can_respond(
+            chat_id=chat_id,
+            is_bot_message=True,
+        ):
+
+            self._blocked_messages += 1
+
+            logger.warning(
+                "Bot-to-bot loop blocked | "
+                "chat=%s | bot=%s",
+                chat_id,
+                bot_id,
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # COOLDOWN
+        # --------------------------------------------------------
+
+        if not self._cooldown_allowed(
+            chat_id=chat_id,
+            bot_id=bot_id,
+        ):
+
+            self._blocked_messages += 1
+
+            logger.warning(
+                "Bot-to-bot cooldown blocked | "
+                "chat=%s | bot=%s",
+                chat_id,
+                bot_id,
+            )
+
+            return False
+
+        # --------------------------------------------------------
+        # ACCEPT
+        # --------------------------------------------------------
+
+        self._accepted_messages += 1
+
+        return True
+
+    # ============================================================
+    # REGISTER INCOMING BOT
+    # ============================================================
+
+    def register_incoming_bot(
+        self,
+        *,
+        message: Message,
+    ) -> BotConversationState | None:
+        """
+        Kiruvchi bot xabarini conversation state'ga yozadi.
+        """
+
+        if not is_bot_message(
+            message
+        ):
+            return None
+
+        bot_id = get_bot_id(
+            message
+        )
+
+        if bot_id is None:
+            return None
+
+        chat_id = int(
+            message.chat.id
+        )
+
+        username = get_bot_username(
+            message
+        )
+
+        key = (
+            chat_id,
+            bot_id,
+        )
+
+        state = self._conversations.get(
+            key
+        )
+
+        if state is None:
+
+            state = BotConversationState(
+                chat_id=chat_id,
+                bot_id=bot_id,
+                bot_username=username,
+                active=True,
+            )
+
+            self._conversations[
+                key
+            ] = state
+
+            self._created_conversations += 1
+
+            logger.info(
+                "Bot conversation created | "
+                "chat=%s | bot=%s | username=%s",
+                chat_id,
+                bot_id,
+                username,
+            )
+
+        else:
+
+            if username:
+                state.bot_username = username
+
+            state.active = True
+
+        state.touch()
+
+        state.incoming_messages += 1
+
+        state.turns += 1
+
+        state.last_message_id = (
+            message.message_id
+        )
+
+        state.last_bot_message = (
+            get_message_text(
+                message
+            )
+        )
+
+        # Loop guard'ga ham yozamiz.
+        loop_guard.register_bot_message(
+            chat_id=chat_id
+        )
+
+        return state
+
+    # ============================================================
+    # REGISTER SARA RESPONSE
+    # ============================================================
+
+    def register_response(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int | None = None,
+        response_text: str = "",
+    ) -> None:
+        """
+        SARA botga javob berganini qayd qiladi.
+        """
+
+        chat_id = int(
+            chat_id
+        )
+
+        # Global loop guard.
+        loop_guard.register_response(
+            chat_id=chat_id
+        )
+
+        self._responses += 1
+
+        # --------------------------------------------------------
+        # Agar bot_id berilmagan bo'lsa,
+        # chatdagi oxirgi active conversation.
+        # --------------------------------------------------------
+
+        if bot_id is None:
+
+            candidates = [
+                state
+                for (
+                    state_chat_id,
+                    state_bot_id,
+                ), state in self._conversations.items()
+                if (
+                    state_chat_id == chat_id
+                    and state.active
+                )
+            ]
+
+            if candidates:
+
+                candidates.sort(
+                    key=lambda item: item.last_activity,
+                    reverse=True,
+                )
+
+                bot_id = candidates[0].bot_id
+
+        if bot_id is None:
+            return
+
+        key = (
+            chat_id,
+            int(bot_id),
+        )
+
+        state = self._conversations.get(
+            key
+        )
+
+        if state is None:
+
+            state = BotConversationState(
+                chat_id=chat_id,
+                bot_id=int(bot_id),
+                active=True,
+            )
+
+            self._conversations[
+                key
+            ] = state
+
+            self._created_conversations += 1
+
+        state.active = True
+
+        state.touch()
+
+        state.sara_responses += 1
+
+        state.last_sara_response = (
+            str(
+                response_text or ""
+            ).strip()
+        )
+
+    # ============================================================
+    # CHECK CONVERSATION
+    # ============================================================
+
+    def has_conversation(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int,
+    ) -> bool:
+
+        state = self._conversations.get(
+            (
+                int(chat_id),
+                int(bot_id),
+            )
+        )
+
+        if state is None:
+            return False
+
+        if not state.active:
+            return False
+
+        return True
+
+    # ============================================================
+    # GET CONVERSATION
+    # ============================================================
+
+    def get_conversation(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int,
+    ) -> BotConversationState | None:
+
+        return self._conversations.get(
+            (
+                int(chat_id),
+                int(bot_id),
+            )
+        )
+
+    # ============================================================
+    # CHAIN LENGTH
+    # ============================================================
+
+    def chain_length(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int | None = None,
+    ) -> int:
+
+        if bot_id is not None:
+
+            state = self.get_conversation(
+                chat_id=chat_id,
+                bot_id=bot_id,
+            )
+
+            if state is None:
+                return 0
+
+            return state.turns
+
+        # --------------------------------------------------------
+        # Chat bo'yicha eng katta chain
+        # --------------------------------------------------------
+
+        values = [
+            state.turns
+            for (
+                state_chat_id,
+                _,
+            ), state in self._conversations.items()
+            if state_chat_id == chat_id
+        ]
+
+        if not values:
+            return 0
+
+        return max(
+            values
+        )
+
+    # ============================================================
+    # COOLDOWN
+    # ============================================================
+
+    def _cooldown_allowed(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int | None,
+    ) -> bool:
+
+        if bot_id is None:
+            return True
+
+        state = self.get_conversation(
+            chat_id=chat_id,
+            bot_id=bot_id,
+        )
+
+        if state is None:
+            return True
+
+        elapsed = (
+            time.monotonic()
+            - state.last_activity
+        )
+
+        return (
+            elapsed
+            >= self.cooldown_seconds
+        )
+
+    # ============================================================
+    # MAX CHAIN
+    # ============================================================
+
+    def max_chain_reached(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int,
+    ) -> bool:
+
+        state = self.get_conversation(
+            chat_id=chat_id,
+            bot_id=bot_id,
+        )
+
+        if state is None:
+            return False
+
+        return (
+            state.turns
+            >= self.max_chain
+        )
+
+    # ============================================================
+    # RESET
+    # ============================================================
+
+    def reset(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int | None = None,
+    ) -> None:
+        """
+        Conversation state'ni tozalaydi.
+
+        bot_id berilsa:
+            faqat shu bot bilan suhbat.
+
+        bot_id berilmasa:
+            chatdagi barcha bot conversation'lar.
+        """
+
+        chat_id = int(
+            chat_id
+        )
+
+        if bot_id is not None:
+
+            self._conversations.pop(
+                (
+                    chat_id,
+                    int(bot_id),
+                ),
+                None,
+            )
+
+            loop_guard.reset(
+                chat_id=chat_id
+            )
+
+            return
+
+        keys = [
+            key
+            for key in self._conversations
+            if key[0] == chat_id
+        ]
+
+        for key in keys:
+
+            self._conversations.pop(
+                key,
+                None,
+            )
+
+        loop_guard.reset(
+            chat_id=chat_id
+        )
+
+    # ============================================================
+    # USER MESSAGE RESET
+    # ============================================================
+
+    def register_user_message(
+        self,
+        *,
+        chat_id: int,
+    ) -> None:
+        """
+        Oddiy foydalanuvchi gapirsa,
+        bot-to-bot chain'ni tozalaydi.
+
+        Bu juda muhim:
+
+            Bot A
+              ↓
+            SARA
+              ↓
+            Bot A
+
+        chain davom etadi.
+
+        Ammo odam aralashsa:
+
+            Bot A
+              ↓
+            SARA
+              ↓
+            USER
+
+        yangi suhbat sifatida qaraladi.
+        """
+
+        chat_id = int(
+            chat_id
+        )
+
+        loop_guard.register_user_message(
+            chat_id=chat_id
+        )
+
+        # Active conversation'larni
+        # darhol o'chirmaymiz.
+        #
+        # Faqat ularni inactive qilamiz,
+        # shunda eski kontekst yo'qolmaydi.
+        for (
+            state_chat_id,
+            _,
+        ), state in self._conversations.items():
+
+            if state_chat_id == chat_id:
+                state.active = False
+
+    # ============================================================
+    # GET CONTEXT
+    # ============================================================
+
+    def build_context(
+        self,
+        *,
+        chat_id: int,
+        bot_id: int,
+    ) -> dict[str, Any]:
+
+        state = self.get_conversation(
+            chat_id=chat_id,
+            bot_id=bot_id,
+        )
+
+        if state is None:
+
+            return {
+                "active": False,
+                "chat_id": chat_id,
+                "bot_id": bot_id,
+                "turns": 0,
+                "incoming_messages": 0,
+                "sara_responses": 0,
+            }
+
+        return {
+            "active": state.active,
+            "chat_id": state.chat_id,
+            "bot_id": state.bot_id,
+            "bot_username": state.bot_username,
+            "turns": state.turns,
+            "incoming_messages": (
+                state.incoming_messages
+            ),
+            "sara_responses": (
+                state.sara_responses
+            ),
+            "last_message_id": (
+                state.last_message_id
+            ),
+            "last_bot_message": (
+                state.last_bot_message
+            ),
+            "last_sara_response": (
+                state.last_sara_response
+            ),
+            "age_seconds": round(
+                time.monotonic()
+                - state.started_at,
+                2,
+            ),
+            "idle_seconds": round(
+                time.monotonic()
+                - state.last_activity,
+                2,
+            ),
+        }
+
+    # ============================================================
+    # CLEANUP
+    # ============================================================
+
+    def cleanup(
+        self,
+        *,
+        max_age_seconds: float = 900.0,
+    ) -> None:
+        """
+        15 daqiqadan eski conversation state'larni
+        xotiradan chiqaradi.
+        """
+
+        now = time.monotonic()
+
+        expired: list[
+            tuple[int, int]
+        ] = []
+
+        for key, state in self._conversations.items():
+
+            if (
+                now - state.last_activity
+                > max_age_seconds
+            ):
+                expired.append(
+                    key
+                )
+
+        for key in expired:
+
+            self._conversations.pop(
+                key,
+                None,
+            )
+
+            logger.debug(
+                "Expired bot conversation removed | "
+                "chat=%s | bot=%s",
+                key[0],
+                key[1],
+            )
+
+    # ============================================================
+    # STATISTICS
+    # ============================================================
+
+    def stats(
+        self,
+    ) -> dict[str, Any]:
+
+        active = sum(
+            1
+            for state in self._conversations.values()
+            if state.active
+        )
+
+        return {
+            "enabled": self.enabled,
+            "active_conversations": active,
+            "stored_conversations": len(
+                self._conversations
+            ),
+            "processed_messages": (
+                self._processed_messages
+            ),
+            "accepted_messages": (
+                self._accepted_messages
+            ),
+            "blocked_messages": (
+                self._blocked_messages
+            ),
+            "responses": self._responses,
+            "created_conversations": (
+                self._created_conversations
+            ),
+            "max_chain": self.max_chain,
+            "cooldown_seconds": (
+                self.cooldown_seconds
+            ),
+        }
+
+    # ============================================================
+    # RESET STATS
+    # ============================================================
+
+    def reset_stats(
+        self,
+    ) -> None:
+
+        self._processed_messages = 0
+        self._accepted_messages = 0
+        self._blocked_messages = 0
+        self._responses = 0
+        self._created_conversations = 0
+
+
+# ================================================================
+# GLOBAL INSTANCE
+# ================================================================
+
+bot_interaction = BotInteractionManager()
+
+
+# ================================================================
+# PUBLIC EXPORTS
+# ================================================================
+
+__all__ = [
+    "BotConversationState",
+    "BotInteractionManager",
+    "bot_interaction",
+    "is_bot_message",
+    "get_bot_id",
+    "get_bot_username",
+    "get_message_text",
+    "bot_was_explicitly_called",
+    "is_reply_to_sara",
+    "is_reply_to_other_bot",
+]
