@@ -8,17 +8,13 @@ from app.database.session import SessionFactory
 
 class MessageService:
     """
-    SARA AI Telegram message service.
+    SARA AI message database service.
 
-    Asosiy API:
-        save()
+    save()
+        Asosiy yangi API.
 
-    Compatibility API:
-        save_message()
-
-    Eski va yangi handlerlar ikkalasi ham
-    ishlashi uchun save_message() save() ga
-    yo'naltiriladi.
+    save_message()
+        Eski handlerlar uchun compatibility API.
     """
 
     async def save(
@@ -66,10 +62,10 @@ class MessageService:
         is_bot_message: bool = False,
     ) -> Message:
         """
-        Backward-compatible API.
+        Compatibility method.
 
-        private.py va boshqa eski handlerlar
-        save_message() ishlatsa ham ishlaydi.
+        private.py hozir save_message() ishlatayotgani
+        uchun bu metod save() ga yo'naltiriladi.
         """
 
         return await self.save(
