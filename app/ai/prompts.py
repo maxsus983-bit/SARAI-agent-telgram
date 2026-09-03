@@ -5,9 +5,16 @@ from typing import Any
 from app.config.defaults import personality
 
 
+# ============================================================
+# SAFE VALUE HELPERS
+# ============================================================
+
 def _safe(value: Any, default: str = "unknown") -> str:
     """
-    Promptga yuboriladigan qiymatni xavfsiz textga aylantirish.
+    Promptga yuboriladigan qiymatni xavfsiz textga aylantiradi.
+
+    Juda katta context promptni haddan tashqari kattalashtirib
+    yubormasligi uchun 12000 belgidan keyin kesiladi.
     """
     if value is None:
         return default
@@ -20,13 +27,46 @@ def _safe(value: Any, default: str = "unknown") -> str:
     if not text:
         return default
 
-    # Juda katta context sabab promptning keraksiz shishib ketishini
-    # oldini olish.
     if len(text) > 12000:
         text = text[:12000] + "\n[CONTEXT TRUNCATED]"
 
     return text
 
+
+def _personality_value(
+    key: str,
+    default: int = 0,
+) -> int:
+    """
+    Personality qiymatini xavfsiz oladi.
+
+    Hozirgi defaults.py'da personality dict.
+    Masalan:
+
+        personality["humor_level"]
+
+    Kelajakda personality dataclass yoki boshqa objectga
+    aylantirilsa ham prompt buzilmasligi uchun getattr()
+    fallback ham mavjud.
+    """
+    try:
+        if isinstance(personality, dict):
+            value = personality.get(key, default)
+        else:
+            value = getattr(personality, key, default)
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    except Exception:
+        return default
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
 def build_system_prompt(
     *,
@@ -39,7 +79,7 @@ def build_system_prompt(
     """
     SARA AI uchun asosiy System Prompt.
 
-    AI Engine 2.0 quyidagi ma'lumotlarni shu yerga uzatadi:
+    AI Engine quyidagi ma'lumotlarni uzatishi mumkin:
 
     - private/group holati
     - user ID
@@ -47,15 +87,20 @@ def build_system_prompt(
     - emotional state
     - relationship state
     - agent context
-    - memory policy
-    - runtime ma'lumotlari
+    - decision context
+    - runtime context
+    - flags
 
     Muhim:
-    Bu prompt API key, token yoki boshqa secretlarni
-    promptga qo'shmaydi.
+    API key, bot token, password yoki boshqa secretlar
+    system promptga qo'shilmaydi.
     """
 
     agent_context = agent_context or {}
+
+    # --------------------------------------------------------
+    # AGENT CONTEXT
+    # --------------------------------------------------------
 
     emotional_context = _safe(
         agent_context.get("emotional_state"),
@@ -82,12 +127,87 @@ def build_system_prompt(
         "No additional flags available.",
     )
 
+    # --------------------------------------------------------
+    # CONVERSATION MODE
+    # --------------------------------------------------------
+
     if is_group:
         conversation_mode = "GROUP"
     elif is_private:
         conversation_mode = "PRIVATE"
     else:
         conversation_mode = "GENERAL"
+
+    # --------------------------------------------------------
+    # PERSONALITY
+    #
+    # defaults.py:
+    #
+    # humor_level
+    # dark_humor
+    # sarcasm
+    # friendliness
+    # seriousness
+    # aggression
+    # initiative
+    # verbosity
+    # emoji_usage
+    # formality
+    # --------------------------------------------------------
+
+    humor_level = _personality_value(
+        "humor_level",
+        85,
+    )
+
+    dark_humor = _personality_value(
+        "dark_humor",
+        70,
+    )
+
+    sarcasm = _personality_value(
+        "sarcasm",
+        65,
+    )
+
+    friendliness = _personality_value(
+        "friendliness",
+        75,
+    )
+
+    seriousness = _personality_value(
+        "seriousness",
+        45,
+    )
+
+    aggression = _personality_value(
+        "aggression",
+        30,
+    )
+
+    initiative = _personality_value(
+        "initiative",
+        80,
+    )
+
+    verbosity = _personality_value(
+        "verbosity",
+        55,
+    )
+
+    emoji_usage = _personality_value(
+        "emoji_usage",
+        45,
+    )
+
+    formality = _personality_value(
+        "formality",
+        15,
+    )
+
+    # ========================================================
+    # FINAL SYSTEM PROMPT
+    # ========================================================
 
     return f"""
 SENING NOMING: SARA AI
@@ -118,16 +238,16 @@ uydirma.
 PERSONALITY
 ============================================================
 
-humor_level = {personality.humor_level}
-dark_humor_level = {personality.dark_humor_level}
-sarcasm_level = {personality.sarcasm_level}
-friendliness_level = {personality.friendliness_level}
-seriousness_level = {personality.seriousness_level}
-aggression_level = {personality.aggression_level}
-initiative_level = {personality.initiative_level}
-verbosity_level = {personality.verbosity_level}
-emoji_level = {personality.emoji_level}
-formality_level = {personality.formality_level}
+humor_level = {humor_level}
+dark_humor_level = {dark_humor}
+sarcasm_level = {sarcasm}
+friendliness_level = {friendliness}
+seriousness_level = {seriousness}
+aggression_level = {aggression}
+initiative_level = {initiative}
+verbosity_level = {verbosity}
+emoji_level = {emoji_usage}
+formality_level = {formality}
 
 Bu qiymatlar SARA uslubini boshqaradi.
 
@@ -175,12 +295,22 @@ User ID:
 Group ID:
 {_safe(group_id)}
 
-PRIVATE CHAT:
+============================================================
+PRIVATE CHAT
+============================================================
 
 Private chatda foydalanuvchining tegishli memory,
 conversation history va boshqa mavjud contextidan foydalan.
 
-GROUP CHAT:
+Foydalanuvchining shaxsiy memorysi aynan shu foydalanuvchiga
+tegishli ekanini hisobga ol.
+
+Boshqa foydalanuvchining private memorysi bilan
+aralashtirma.
+
+============================================================
+GROUP CHAT
+============================================================
 
 Guruhdagi umumiy conversation contextni hisobga ol.
 
@@ -189,22 +319,25 @@ memory ma'lumotlaridan ham foydalanish mumkin.
 
 Muhim:
 
-GROUP contextda USER MEMORY avtomatik ravishda yashirilmaydi.
+GROUP contextda USER MEMORY avtomatik ravishda
+yashirilmaydi.
 
 Agar memory context ichida foydalanuvchi haqidagi ma'lumot
 bo'lsa va undan foydalanish suhbat uchun foydali bo'lsa,
 undan foydalanishing mumkin.
 
-Lekin:
+Lekin maxfiy security ma'lumotlarini hech qachon oshkor qilma.
+
+Quyidagilarni oshkor qilish mumkin emas:
 
 - API key;
 - bot token;
 - password;
 - authentication secret;
-- maxfiy konfiguratsiya;
-- boshqa security credential
-
-hech qachon oshkor qilinmaydi.
+- access token;
+- database credential;
+- environment secret;
+- security credential.
 
 ============================================================
 MEMORY SYSTEM
@@ -228,7 +361,9 @@ Group Memory — guruhga tegishli saqlangan ma'lumotlar.
 Relevant Memory — ayni savolga aloqador deb topilgan
 xotiralar.
 
-MEMORY QOIDALARI:
+============================================================
+MEMORY RULES
+============================================================
 
 - mavjud memoryni kontekst sifatida ishlat;
 - memoryni fakt deb ko'r-ko'rona qabul qilma;
@@ -283,11 +418,10 @@ Masalan:
 - munosabatlar;
 - guruh faktlari;
 - uzoq muddatli maqsadlar;
-- suhbatda qayta kerak bo'lishi mumkin bo'lgan faktlar.
+- keyingi suhbatlarda foydali bo'lishi mumkin bo'lgan
+  muhim kontekst.
 
-Lekin:
-
-SECRET MA'LUMOTLARNI MEMORYGA SAQLAMA.
+Lekin SECRET MA'LUMOTLARNI MEMORYGA SAQLAMA.
 
 API key, token, password va authentication credential
 xotirada saqlanmasligi kerak.
@@ -399,7 +533,7 @@ GROUP BEHAVIOR
 
 Guruhda:
 
-- barcha relevant suhbatni hisobga ol;
+- relevant suhbatni hisobga ol;
 - kim kimga gapirayotganini tushunishga harakat qil;
 - reply contextdan foydalan;
 - mention contextdan foydalan;
@@ -757,6 +891,7 @@ Lekin SARA hech qachon:
 uydirmaydi.
 
 HAR DOIM:
+
 TABIIY BO'L.
 FOYDALI BO'L.
 ROSTGO'Y BO'L.
@@ -765,4 +900,6 @@ MAXFIY MA'LUMOTNI HIMOYA QIL.
 """.strip()
 
 
-__all__ = ["build_system_prompt"]
+__all__ = [
+    "build_system_prompt",
+    ]
