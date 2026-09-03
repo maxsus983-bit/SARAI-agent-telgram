@@ -1,572 +1,317 @@
 from __future__ import annotations
 
 import logging
-import re
+from typing import Any
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.types import Message
 
-from app.agent.bot_interaction import (
-    bot_interaction,
-    is_bot_message,
-)
-from app.agent.loop_guard import loop_guard
-from app.agent.proactive import proactive_agent
-from app.agent.group_agent import group_agent
+from app.agent.telegram_bridge import process_group_message
 from app.services.group_service import group_service
 from app.services.message_service import message_service
 from app.services.user_service import user_service
 
 logger = logging.getLogger("sara.bot.groups")
 
-router = Router(name="group_messages")
+router = Router(name="groups")
 
 
-# ============================================================
-# SARA DETECTION
-# ============================================================
+def _get_text(message: Message) -> str:
+    """
+    Telegram xabaridan ishlatiladigan matnni oladi.
 
-SARA_PATTERN = re.compile(
-    r"(?<!\w)sara(?!\w)",
-    re.IGNORECASE,
-)
-
-
-async def get_sara_username(
-    message: Message,
-) -> str | None:
-
-    cached = getattr(
-        message.bot,
-        "_sara_username",
-        None,
-    )
-
-    if cached:
-        return cached
-
-    try:
-
-        me = await message.bot.get_me()
-
-        if me.username:
-
-            setattr(
-                message.bot,
-                "_sara_username",
-                me.username,
-            )
-
-            return me.username
-
-    except Exception:
-
-        logger.exception(
-            "SARA username olishda xato."
-        )
-
-    return None
+    Hozircha text va caption qo'llab-quvvatlanadi.
+    Media handlerlar keyinroq media ma'lumotlarini ham
+    agent pipeline'iga uzatishi mumkin.
+    """
+    text = message.text or message.caption or ""
+    return str(text).strip()
 
 
-async def is_sara_called(
-    message: Message,
-) -> bool:
+def _is_reply_to_sara(message: Message, bot: Bot) -> bool:
+    """
+    Xabar SARA yuborgan xabarga reply ekanligini aniqlaydi.
+    """
+    reply = message.reply_to_message
 
+    if reply is None:
+        return False
+
+    if reply.from_user is None:
+        return False
+
+    if not reply.from_user.is_bot:
+        return False
+
+    if bot.id is None:
+        return False
+
+    return int(reply.from_user.id) == int(bot.id)
+
+
+async def _save_user(message: Message) -> Any:
+    """
+    Telegram foydalanuvchisini DB'da yaratadi yoki yangilaydi.
+    """
     if message.from_user is None:
-        return False
-
-    text = message.text or ""
-
-    if not text:
-        return False
-
-    # "sara" yozilgan bo'lsa
-    if SARA_PATTERN.search(text):
-        return True
-
-    # @sara yozilgan bo'lsa
-    username = await get_sara_username(
-        message
-    )
-
-    if username:
-
-        if (
-            f"@{username.lower()}"
-            in text.lower()
-        ):
-            return True
-
-    # SARA xabariga reply bo'lsa
-    if message.reply_to_message:
-
-        replied_user = (
-            message.reply_to_message.from_user
-        )
-
-        if replied_user and replied_user.is_bot:
-
-            if (
-                username
-                and replied_user.username
-                and replied_user.username.lower()
-                == username.lower()
-            ):
-                return True
-
-    return False
-
-
-def is_reply_to_sara(
-    message: Message,
-) -> bool:
-
-    if not message.reply_to_message:
-        return False
-
-    replied = (
-        message.reply_to_message.from_user
-    )
-
-    if not replied:
-        return False
-
-    if not replied.is_bot:
-        return False
-
-    username = getattr(
-        message.bot,
-        "_sara_username",
-        None,
-    )
-
-    if not username:
-        return False
-
-    return bool(
-        replied.username
-        and replied.username.lower()
-        == username.lower()
-    )
-
-
-def clean_message(
-    message: Message,
-) -> str:
-
-    text = message.text or ""
-
-    # sara so'zini olib tashlash
-    text = SARA_PATTERN.sub(
-        "",
-        text,
-    )
-
-    username = getattr(
-        message.bot,
-        "_sara_username",
-        None,
-    )
-
-    if username:
-
-        text = re.sub(
-            rf"@{re.escape(username)}",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
-def looks_like_question(
-    text: str,
-) -> bool:
-
-    if not text:
-        return False
-
-    if "?" in text:
-        return True
-
-    lowered = text.lower()
-
-    question_words = (
-        "nima",
-        "nega",
-        "qanday",
-        "qachon",
-        "qayer",
-        "qayerda",
-        "kim",
-        "kimga",
-        "kimni",
-        "qancha",
-        "qaysi",
-        "mumkinmi",
-        "bilasanmi",
-        "ayt",
-        "aytchi",
-        "what",
-        "why",
-        "how",
-        "when",
-        "where",
-        "who",
-        "which",
-        "can you",
-        "do you",
-        "почему",
-        "как",
-        "когда",
-        "где",
-        "кто",
-        "какой",
-        "можешь",
-    )
-
-    return any(
-        lowered == word
-        or lowered.startswith(word + " ")
-        for word in question_words
-    )
-
-
-# ============================================================
-# GROUP MESSAGE
-# ============================================================
-
-async def process_group_message(
-    message: Message,
-) -> None:
-
-    if message.from_user is None:
-        return
-
-    if not message.text:
-        return
+        return None
 
     user = message.from_user
-    chat_id = message.chat.id
+
+    return await user_service.get_or_create_user(
+        telegram_id=int(user.id),
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language=user.language_code,
+        is_bot=bool(user.is_bot),
+    )
+
+
+async def _save_group(message: Message) -> Any:
+    """
+    Guruhni DB'da yaratadi yoki yangilaydi.
+
+    Muhim:
+    Admin hech qanday /enable yoki /start command berishi shart emas.
+    Guruhga SARA qo'shilishi bilan guruh avtomatik ravishda
+    kuzatuv va agent pipeline'iga kiradi.
+    """
+    chat = message.chat
+
+    return await group_service.get_or_create_group(
+        telegram_id=int(chat.id),
+        title=chat.title or "",
+        username=getattr(chat, "username", None),
+    )
+
+
+async def _save_message(message: Message, text: str) -> Any:
+    """
+    Guruhdagi har bir matnli xabarni conversation history'ga saqlaydi.
+    """
+    if message.from_user is None:
+        return None
+
+    return await message_service.save_message(
+        telegram_message_id=int(message.message_id),
+        chat_id=int(message.chat.id),
+        user_telegram_id=int(message.from_user.id),
+        role="user",
+        content=text,
+        message_type="text",
+        reply_to_message_id=(
+            int(message.reply_to_message.message_id)
+            if message.reply_to_message is not None
+            else None
+        ),
+        is_bot_message=bool(message.from_user.is_bot),
+    )
+
+
+async def _save_bot_response(
+    message: Message,
+    response_text: str,
+) -> Any:
+    """
+    SARA yuborgan javobni conversation history'ga saqlaydi.
+    """
+    return await message_service.save_message(
+        telegram_message_id=0,
+        chat_id=int(message.chat.id),
+        user_telegram_id=None,
+        role="assistant",
+        content=response_text,
+        message_type="text",
+        reply_to_message_id=int(message.message_id),
+        is_bot_message=True,
+    )
+
+
+def _was_already_sent(result: Any) -> bool:
+    """
+    Executor Telegram Tool orqali javobni allaqachon yuborgan bo'lsa,
+    handler ikkinchi marta yubormasligi uchun tekshiradi.
+    """
+    try:
+        agent_result = getattr(result, "agent_result", None)
+
+        if agent_result is None:
+            return False
+
+        execution = getattr(agent_result, "execution", None)
+
+        if execution is None:
+            return False
+
+        metadata = getattr(execution, "metadata", None)
+
+        if not isinstance(metadata, dict):
+            return False
+
+        return bool(metadata.get("telegram_sent", False))
+
+    except Exception:
+        return False
+
+
+@router.message()
+async def handle_group_message(message: Message, bot: Bot) -> None:
+    """
+    Guruhdagi asosiy SARA handler.
+
+    Har bir xabar:
+        Telegram
+          ↓
+        User/Group DB
+          ↓
+        Conversation History
+          ↓
+        Agent Runtime
+          ↓
+        Brain
+          ↓
+        Memory Retrieval
+          ↓
+        Planner
+          ↓
+        Executor
+          ↓
+        Telegram
+
+    Brain o'zi qaror qiladi:
+      - javob berish
+      - jim turish
+      - savol berish
+      - xotiraga saqlash
+      - reminder
+      - tool ishlatish
+      - proactive javob
+    """
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+
+    if message.from_user is None:
+        return
+
+    text = _get_text(message)
+
+    # Media yoki bo'sh service-message bo'lsa,
+    # media handlerlar uchun boshqa pipeline ishlashi mumkin.
+    if not text:
+        return
 
     try:
+        # ---------------------------------------------------------
+        # 1. USER
+        # ---------------------------------------------------------
+        await _save_user(message)
 
-        # ====================================================
-        # USER
-        # ====================================================
+        # ---------------------------------------------------------
+        # 2. GROUP
+        # ---------------------------------------------------------
+        await _save_group(message)
 
-        db_user = await user_service.get_or_create(
-            user
-        )
+        # ---------------------------------------------------------
+        # 3. RAW CONVERSATION HISTORY
+        # ---------------------------------------------------------
+        await _save_message(message, text)
 
-        # ====================================================
-        # GROUP
-        # ====================================================
+        # ---------------------------------------------------------
+        # 4. SARA'GA XABAR
+        # ---------------------------------------------------------
+        reply_to_sara = _is_reply_to_sara(message, bot)
 
-        db_group = await group_service.get_or_create(
-            message.chat
-        )
-
-        # ====================================================
-        # DETECTION
-        # ====================================================
-
-        called = await is_sara_called(
-            message
-        )
-
-        reply_to_sara = is_reply_to_sara(
-            message
-        )
-
-        question = looks_like_question(
-            message.text
-        )
-
-        bot_message = is_bot_message(
-            message
-        )
-
-        # ====================================================
-        # BOT → BOT
-        # ====================================================
-
-        if bot_message:
-
-            if not bot_interaction.should_process(
-                message=message,
-                sara_username=await get_sara_username(
-                    message
-                ),
-            ):
-                return
-
-            bot_interaction.register_incoming_bot(
-                message=message
-            )
-
-        # ====================================================
-        # SAVE MESSAGE
-        # ====================================================
-
-        saved_message = await message_service.save(
-            telegram_message_id=message.message_id,
-            chat_id=chat_id,
-            user_telegram_id=user.id,
-            role="user",
-            content=message.text,
-            message_type="text",
-            reply_to_message_id=(
-                message.reply_to_message.message_id
-                if message.reply_to_message
-                else None
-            ),
-            is_bot_message=bot_message,
-        )
-
-        # ====================================================
-        # PROACTIVE DECISION
-        # ====================================================
-
-        decision = proactive_agent.decide(
-            chat_id=chat_id,
-            group_enabled=db_group.enabled,
-            quiet_mode=db_group.quiet_mode,
-            sara_called=called,
-            message_is_question=question,
-            message_is_reply_to_sara=reply_to_sara,
-            is_bot_message=bot_message,
-        )
-
-        if not decision.should_respond:
-
-            logger.debug(
-                "Proactive Agent decided to ignore | "
-                "chat=%s | reason=%s",
-                chat_id,
-                decision.reason,
-            )
-
-            return
-
-        # ====================================================
-        # LOOP GUARD
-        # ====================================================
-
-        if not loop_guard.can_respond(
-            chat_id=chat_id,
-            is_bot_message=bot_message,
-        ):
-
-            logger.warning(
-                "Response blocked by LoopGuard | "
-                "chat=%s",
-                chat_id,
-            )
-
-            return
-
-        # ====================================================
-        # CLEAN MESSAGE
-        # ====================================================
-
-        cleaned_text = clean_message(
-            message
-        )
-
-        if not cleaned_text:
-
-            if called or reply_to_sara:
-
-                cleaned_text = (
-                    "Guruhdagi suhbatni hisobga olib "
-                    "foydali va tabiiy javob ber."
-                )
-
-            else:
-
-                cleaned_text = (
-                    "Guruhdagi suhbatga mos "
-                    "qisqa va tabiiy javob ber."
-                )
-
-        # ====================================================
-        # AGENT
-        # ====================================================
-        #
-        # Bu yerda endi:
-        #
-        # Runtime
-        #   ↓
-        # Brain
-        #   ↓
-        # Planner
-        #   ↓
-        # Executor
-        #
-        # ishlaydi.
-        #
-
-        result = await group_agent.process(
-            message=message,
-            sara_called=called,
+        result = await process_group_message(
+            message,
+            text=text,
+            sara_called=False,
             is_reply_to_sara=reply_to_sara,
             proactive_allowed=True,
-            activity_context={
-                "source": "telegram_group",
+            extra_flags={
+                "source": "telegram_group_handler",
+                "source_message_id": int(message.message_id),
+                "telegram_message_id": int(message.message_id),
+                "chat_id": int(message.chat.id),
+                "chat_type": str(message.chat.type),
+                "user_id": int(message.from_user.id),
+                "group_id": int(message.chat.id),
 
-                "source_message_id": saved_message.id,
+                # MEMORY POLICY:
+                # Guruhda user memory ishlatilishi mumkin.
+                "use_user_memory": True,
+                "use_group_memory": True,
+                "use_conversation_memory": True,
 
-                "cleaned_text": cleaned_text,
-
-                "is_question": question,
-
-                "is_bot_message": bot_message,
-
-                # User memory guruh agentiga beriladi.
-                "allow_user_memory": True,
-
-                # Group memory ham beriladi.
-                "allow_group_memory": True,
-
-                # Conversation memory.
-                "allow_conversation_memory": True,
-
-                # Kelajakdagi long-term memory.
-                "remember_context": True,
-
-                # User + Group + Conversation.
-                "memory_scope": (
-                    "user_and_group_and_conversation"
-                ),
+                # SARA guruhda avtomatik faol bo'lishi mumkin.
+                "autonomous_group_mode": True,
+                "group_auto_enabled": True,
             },
         )
 
-        # ====================================================
-        # AGENT RESULT
-        # ====================================================
+        if not getattr(result, "success", False):
+            error = getattr(result, "error", None)
 
-        if not result.success:
-
-            logger.error(
-                "Group Agent failed | "
-                "chat=%s | user=%s | error=%s",
-                chat_id,
-                user.id,
-                result.error,
-            )
+            if error:
+                logger.warning(
+                    "SARA group processing failed | chat=%s | error=%s",
+                    message.chat.id,
+                    error,
+                )
 
             return
 
-        if not result.should_send:
-
-            return
-
-        answer = (
-            result.response_text or ""
+        should_send = bool(getattr(result, "should_send", False))
+        response_text = str(
+            getattr(result, "response_text", "") or ""
         ).strip()
 
-        if not answer:
+        if not should_send or not response_text:
             return
 
-        # ====================================================
-        # REGISTER RESPONSE
-        # ====================================================
+        # ---------------------------------------------------------
+        # 5. AGENT EXECUTOR TELEGRAM TOOL ORQALI YUBORGAN BO'LSA
+        # ---------------------------------------------------------
+        if _was_already_sent(result):
+            return
 
-        loop_guard.register_response(
-            chat_id=chat_id
-        )
-
-        loop_guard.register_bot_message(
-            chat_id=chat_id
-        )
-
-        proactive_agent.record_response(
-            chat_id=chat_id
-        )
-
-        if bot_message:
-
-            bot_interaction.register_response(
-                chat_id=chat_id
-            )
-
-        # ====================================================
-        # SAVE ASSISTANT MESSAGE
-        # ====================================================
+        # ---------------------------------------------------------
+        # 6. FALLBACK TELEGRAM SEND
         #
-        # Telegram Tool orqali javob yuboriladi.
-        # Bu yerda faqat DB historyga yozamiz.
-        #
+        # Bu faqat Executor Telegram Tool javob yubormagan bo'lsa
+        # ishlaydi.
+        # ---------------------------------------------------------
+        sent = await bot.send_message(
+            chat_id=message.chat.id,
+            text=response_text,
+            reply_to_message_id=message.message_id,
+        )
 
-        await message_service.save(
-            telegram_message_id=None,
-            chat_id=chat_id,
+        # ---------------------------------------------------------
+        # 7. SARA JAVOBINI HISTORY'GA SAQLASH
+        # ---------------------------------------------------------
+        await message_service.save_message(
+            telegram_message_id=int(sent.message_id),
+            chat_id=int(message.chat.id),
             user_telegram_id=None,
             role="assistant",
-            content=answer,
+            content=response_text,
             message_type="text",
-            reply_to_message_id=message.message_id,
+            reply_to_message_id=int(message.message_id),
             is_bot_message=True,
         )
 
         logger.info(
-            "Group Agent response processed | "
-            "chat=%s | user=%s | action=%s",
-            chat_id,
-            user.id,
-            getattr(
-                result.decision,
-                "action",
-                None,
-            ),
+            "SARA group response sent | chat=%s | message=%s",
+            message.chat.id,
+            sent.message_id,
         )
 
     except Exception:
-
         logger.exception(
-            "Group message processing failed | "
-            "chat=%s | user=%s",
-            chat_id,
-            user.id,
+            "Unhandled group handler error | chat=%s",
+            message.chat.id,
         )
 
-        try:
 
-            await message.answer(
-                "Hozir xabarni qayta ishlashda muammo yuz berdi."
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Group error message failed."
-            )
-
-
-# ============================================================
-# TELEGRAM HANDLER
-# ============================================================
-
-@router.message(
-    lambda message: (
-        message.chat.type
-        in {"group", "supergroup"}
-        and bool(message.from_user)
-        and bool(message.text)
-    )
-)
-async def handle_group_message(
-    message: Message,
-) -> None:
-
-    await process_group_message(
-        message
-                )
+__all__ = ["router"]
