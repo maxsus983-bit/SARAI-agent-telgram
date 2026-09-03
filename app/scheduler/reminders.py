@@ -1,264 +1,378 @@
 from __future__ import annotations
 
-import logging
-from typing import Any
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from app.scheduler.reminders import (
-    format_reminder_time,
-    parse_reminder,
-)
-from app.scheduler.manager import scheduler_manager
+from app.config.settings import settings
 
 
-logger = logging.getLogger("sara.agent.tools.reminder")
+# ============================================================
+# REMINDER DATA
+# ============================================================
+
+@dataclass(slots=True)
+class ParsedReminder:
+    text: str
+    remind_at: datetime
 
 
-class ReminderTool:
+# ============================================================
+# TIMEZONE
+# ============================================================
+
+def _timezone() -> ZoneInfo:
+    return ZoneInfo(settings.timezone)
+
+
+# ============================================================
+# FORMAT TIME
+# ============================================================
+
+def format_reminder_time(dt: datetime) -> str:
     """
-    SARA AI Reminder Tool.
-
-    Vazifalari:
-
-    - Natural language reminder yaratish
-    - Reminderlarni ko'rish
-    - Reminderni olish
-    - Reminderni bekor qilish
-    - Reminder vaqtini formatlash
-    - Scheduler bilan ishlash
+    Reminder vaqtini odamga tushunarli ko'rinishga keltiradi.
     """
 
-    # ============================================================
-    # CREATE
-    # ============================================================
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_timezone())
 
-    async def create(
-        self,
-        *,
-        owner_telegram_id: int,
-        chat_id: int,
-        text: str,
-    ) -> dict[str, Any]:
+    dt = dt.astimezone(_timezone())
 
-        if not text or not text.strip():
-            return {
-                "success": False,
-                "error": "Reminder matni bo'sh.",
-            }
+    return dt.strftime("%d.%m.%Y %H:%M")
 
-        parsed = parse_reminder(text)
 
-        if parsed is None:
-            return {
-                "success": False,
-                "error": (
-                    "Reminder vaqtini tushunib bo'lmadi. "
-                    "Masalan: '10 daqiqadan keyin suv ichishni eslat' "
-                    "yoki 'ertaga soat 10:00 da uchrashuvni eslat'."
-                ),
-            }
+# ============================================================
+# TEXT CLEANUP
+# ============================================================
 
-        reminder = await scheduler_manager.create_reminder(
-            owner_telegram_id=owner_telegram_id,
-            chat_id=chat_id,
-            text=parsed.text,
-            remind_at=parsed.remind_at,
+def _clean_reminder_text(text: str) -> str:
+    """
+    Reminder matnidan vaqt haqidagi qismini olib tashlaydi.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+        flags=re.UNICODE,
+    ).strip()
+
+    # Oxiridagi "eslat", "eslatib qo'y", "eslatib qo‘y"
+    text = re.sub(
+        r"\s+(?:menga\s+)?eslat(?:ib)?\s*(?:qo['’`]?y)?[.!]?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s+(?:menga\s+)?eslat[.!]?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text.strip(" .,!?")
+
+
+# ============================================================
+# PARSE REMINDER
+# ============================================================
+
+def parse_reminder(text: str) -> ParsedReminder | None:
+    """
+    Uzbek tilidagi oddiy natural-language reminderlarni
+    datetime'ga aylantiradi.
+
+    Qo'llab-quvvatlanadi:
+
+        10 daqiqadan keyin suv ichishni eslat
+        1 soatdan keyin menga yozishni eslat
+        30 minutdan keyin ...
+        2 kundan keyin ...
+        ertaga soat 10:00 da ...
+        ertaga 10:00 da ...
+        bugun 20:30 da ...
+        soat 18:00 da ...
+        18:00 da ...
+    """
+
+    if not text:
+        return None
+
+    original = str(text).strip()
+
+    if not original:
+        return None
+
+    now = datetime.now(_timezone())
+
+    # ========================================================
+    # 1. "X DAQIQA / SOAT / KUN DAN KEYIN"
+    # ========================================================
+
+    relative_pattern = re.compile(
+        r"^\s*"
+        r"(?P<amount>\d+(?:[.,]\d+)?)"
+        r"\s*"
+        r"(?P<unit>"
+        r"daqiqa|daqiqadan|"
+        r"minut|minutdan|"
+        r"soat|soatdan|"
+        r"kun|kundan|"
+        r"hafta|haftadan"
+        r")"
+        r"\s*"
+        r"keyin"
+        r"(?:\s+da)?"
+        r"\s*"
+        r"(?P<message>.*)"
+        r"$",
+        re.IGNORECASE,
+    )
+
+    match = relative_pattern.match(original)
+
+    if match:
+        amount = float(
+            match.group("amount").replace(",", ".")
         )
 
-        logger.info(
-            "Reminder Tool create | id=%s | owner=%s | chat=%s",
-            reminder.id,
-            owner_telegram_id,
-            chat_id,
-        )
+        unit = match.group("unit").lower()
+        message = match.group("message").strip()
 
-        return {
-            "success": True,
-            "operation": "create",
-            "reminder_id": reminder.id,
-            "owner_telegram_id": owner_telegram_id,
-            "chat_id": chat_id,
-            "text": reminder.text,
-            "remind_at": reminder.remind_at.isoformat(),
-            "formatted_time": format_reminder_time(
-                reminder.remind_at
-            ),
-        }
-
-    # ============================================================
-    # GET
-    # ============================================================
-
-    async def get(
-        self,
-        *,
-        owner_telegram_id: int,
-        reminder_id: int,
-    ) -> dict[str, Any]:
-
-        reminder = await scheduler_manager.get_reminder(
-            reminder_id=reminder_id,
-            owner_telegram_id=owner_telegram_id,
-        )
-
-        if reminder is None:
-            return {
-                "success": False,
-                "error": "Reminder topilmadi.",
-            }
-
-        return {
-            "success": True,
-            "operation": "get",
-            "reminder_id": reminder.id,
-            "owner_telegram_id": reminder.owner_telegram_id,
-            "chat_id": reminder.chat_id,
-            "text": reminder.text,
-            "remind_at": reminder.remind_at.isoformat(),
-            "formatted_time": format_reminder_time(
-                reminder.remind_at
-            ),
-            "completed": reminder.completed,
-            "cancelled": reminder.cancelled,
-        }
-
-    # ============================================================
-    # LIST
-    # ============================================================
-
-    async def list(
-        self,
-        *,
-        owner_telegram_id: int,
-        include_completed: bool = False,
-    ) -> dict[str, Any]:
-
-        reminders = await scheduler_manager.get_user_reminders(
-            owner_telegram_id=owner_telegram_id,
-            include_completed=include_completed,
-        )
-
-        items = []
-
-        for reminder in reminders:
-            items.append(
-                {
-                    "id": reminder.id,
-                    "chat_id": reminder.chat_id,
-                    "text": reminder.text,
-                    "remind_at": reminder.remind_at.isoformat(),
-                    "formatted_time": format_reminder_time(
-                        reminder.remind_at
-                    ),
-                    "completed": reminder.completed,
-                    "cancelled": reminder.cancelled,
-                }
+        if "daqiqa" in unit or "minut" in unit:
+            remind_at = now + timedelta(
+                minutes=amount
             )
 
-        return {
-            "success": True,
-            "operation": "list",
-            "count": len(items),
-            "reminders": items,
-        }
+        elif "soat" in unit:
+            remind_at = now + timedelta(
+                hours=amount
+            )
 
-    # ============================================================
-    # CANCEL
-    # ============================================================
+        elif "kun" in unit:
+            remind_at = now + timedelta(
+                days=amount
+            )
 
-    async def cancel(
-        self,
-        *,
-        owner_telegram_id: int,
-        reminder_id: int,
-    ) -> dict[str, Any]:
+        elif "hafta" in unit:
+            remind_at = now + timedelta(
+                weeks=amount
+            )
 
-        success = await scheduler_manager.cancel_reminder(
-            reminder_id=reminder_id,
-            owner_telegram_id=owner_telegram_id,
+        else:
+            return None
+
+        message = _clean_reminder_text(message)
+
+        if not message:
+            message = "Reminder"
+
+        return ParsedReminder(
+            text=message,
+            remind_at=remind_at,
         )
 
-        if not success:
-            return {
-                "success": False,
-                "error": (
-                    "Reminder bekor qilinmadi. "
-                    "U mavjud emas, allaqachon bajarilgan "
-                    "yoki allaqachon bekor qilingan bo'lishi mumkin."
-                ),
-            }
+    # ========================================================
+    # 2. TIME EXTRACTOR
+    # ========================================================
 
-        return {
-            "success": True,
-            "operation": "cancel",
-            "reminder_id": reminder_id,
-        }
+    time_pattern = re.compile(
+        r"(?:"
+        r"soat\s*"
+        r")?"
+        r"(?P<hour>\d{1,2})"
+        r"[:.](?P<minute>\d{2})"
+        r"(?:\s*(?P<ampm>am|pm))?"
+        r"\s*(?:da)?",
+        re.IGNORECASE,
+    )
 
+    time_match = time_pattern.search(original)
 
-# ================================================================
-# GLOBAL INSTANCE
-# ================================================================
+    # ========================================================
+    # 3. "ERTAGA"
+    # ========================================================
 
-reminder_tool = ReminderTool()
+    if re.search(
+        r"\bertaga\b",
+        original,
+        re.IGNORECASE,
+    ):
+        if time_match:
+            hour = int(time_match.group("hour"))
+            minute = int(time_match.group("minute"))
 
+            ampm = time_match.group("ampm")
 
-# ================================================================
-# TOOL HANDLER
-# ================================================================
+            if ampm:
+                ampm = ampm.lower()
 
-async def reminder_tool_handler(
-    operation: str,
-    **kwargs: Any,
-) -> dict[str, Any]:
+                if ampm == "pm" and hour < 12:
+                    hour += 12
 
-    operation = str(operation).strip().lower()
+                if ampm == "am" and hour == 12:
+                    hour = 0
 
-    if operation == "create":
-        return await reminder_tool.create(
-            owner_telegram_id=int(
-                kwargs["owner_telegram_id"]
-            ),
-            chat_id=int(
-                kwargs["chat_id"]
-            ),
-            text=str(
-                kwargs["text"]
-            ),
+            if hour > 23 or minute > 59:
+                return None
+
+            target_date = now.date() + timedelta(days=1)
+
+            remind_at = datetime(
+                target_date.year,
+                target_date.month,
+                target_date.day,
+                hour,
+                minute,
+                tzinfo=_timezone(),
+            )
+
+            message = original[
+                :time_match.start()
+            ] + original[
+                time_match.end():
+            ]
+
+            message = re.sub(
+                r"\bertaga\b",
+                "",
+                message,
+                flags=re.IGNORECASE,
+            )
+
+            message = _clean_reminder_text(message)
+
+            if not message:
+                message = "Reminder"
+
+            return ParsedReminder(
+                text=message,
+                remind_at=remind_at,
+            )
+
+    # ========================================================
+    # 4. "BUGUN"
+    # ========================================================
+
+    if re.search(
+        r"\bbugun\b",
+        original,
+        re.IGNORECASE,
+    ):
+        if time_match:
+            hour = int(time_match.group("hour"))
+            minute = int(time_match.group("minute"))
+
+            ampm = time_match.group("ampm")
+
+            if ampm:
+                ampm = ampm.lower()
+
+                if ampm == "pm" and hour < 12:
+                    hour += 12
+
+                if ampm == "am" and hour == 12:
+                    hour = 0
+
+            if hour > 23 or minute > 59:
+                return None
+
+            remind_at = datetime(
+                now.year,
+                now.month,
+                now.day,
+                hour,
+                minute,
+                tzinfo=_timezone(),
+            )
+
+            # Agar bugungi vaqt o'tib ketgan bo'lsa,
+            # ertaga deb olish.
+            if remind_at <= now:
+                remind_at += timedelta(days=1)
+
+            message = (
+                original[:time_match.start()]
+                + original[time_match.end():]
+            )
+
+            message = re.sub(
+                r"\bbugun\b",
+                "",
+                message,
+                flags=re.IGNORECASE,
+            )
+
+            message = _clean_reminder_text(message)
+
+            if not message:
+                message = "Reminder"
+
+            return ParsedReminder(
+                text=message,
+                remind_at=remind_at,
+            )
+
+    # ========================================================
+    # 5. FAQAT "SOAT 18:00 DA ..."
+    # ========================================================
+
+    if time_match:
+        hour = int(time_match.group("hour"))
+        minute = int(time_match.group("minute"))
+
+        ampm = time_match.group("ampm")
+
+        if ampm:
+            ampm = ampm.lower()
+
+            if ampm == "pm" and hour < 12:
+                hour += 12
+
+            if ampm == "am" and hour == 12:
+                hour = 0
+
+        if hour > 23 or minute > 59:
+            return None
+
+        remind_at = datetime(
+            now.year,
+            now.month,
+            now.day,
+            hour,
+            minute,
+            tzinfo=_timezone(),
         )
 
-    if operation == "get":
-        return await reminder_tool.get(
-            owner_telegram_id=int(
-                kwargs["owner_telegram_id"]
-            ),
-            reminder_id=int(
-                kwargs["reminder_id"]
-            ),
+        # Bugungi vaqt o'tib ketgan bo'lsa,
+        # keyingi kun.
+        if remind_at <= now:
+            remind_at += timedelta(days=1)
+
+        message = (
+            original[:time_match.start()]
+            + original[time_match.end():]
         )
 
-    if operation == "list":
-        return await reminder_tool.list(
-            owner_telegram_id=int(
-                kwargs["owner_telegram_id"]
-            ),
-            include_completed=bool(
-                kwargs.get(
-                    "include_completed",
-                    False,
-                )
-            ),
+        message = _clean_reminder_text(message)
+
+        if not message:
+            message = "Reminder"
+
+        return ParsedReminder(
+            text=message,
+            remind_at=remind_at,
         )
 
-    if operation == "cancel":
-        return await reminder_tool.cancel(
-            owner_telegram_id=int(
-                kwargs["owner_telegram_id"]
-            ),
-            reminder_id=int(
-                kwargs["reminder_id"]
-            ),
-        )
+    return None
 
-    return {
-        "success": False,
-        "error": f"Noma'lum reminder operation: {operation}",
-        }
+
+__all__ = [
+    "ParsedReminder",
+    "parse_reminder",
+    "format_reminder_time",
+            ]
