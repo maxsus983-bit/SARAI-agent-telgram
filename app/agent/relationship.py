@@ -667,4 +667,4 @@ relationship_manager = RelationshipManager()
 __all__ = [
     "RelationshipManager",
     "relationship_manager",
-        ]
+]
