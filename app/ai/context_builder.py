@@ -16,24 +16,6 @@ async def build_context(
     recent_messages: int | None = None,
     memory_results: int | None = None,
 ) -> dict[str, str]:
-    """
-    SARA AI context builder.
-
-    PRIVATE CHAT:
-        conversation
-        +
-        private user memory
-
-    GROUP CHAT:
-        conversation
-        +
-        group memory
-
-    Muhim:
-        Private user memory guruh contextiga kiritilmaydi.
-
-    Bu privacy isolation uchun ataylab qilingan.
-    """
 
     recent_limit = (
         recent_messages
@@ -47,62 +29,69 @@ async def build_context(
         else settings.max_memory_results
     )
 
-    # ============================================================
-    # CONVERSATION
-    # ============================================================
+    # =========================================================
+    # CONVERSATION MEMORY
+    # =========================================================
 
     conversation = await build_conversation_context(
         chat_id=chat_id,
         limit=recent_limit,
     )
 
-    # ============================================================
-    # PRIVATE CHAT
-    # ============================================================
+    # =========================================================
+    # USER MEMORY
+    # =========================================================
 
-    if group_id is None:
+    if user_id is not None:
 
-        if user_id is not None:
-            user_memory = await retrieve_user_memory(
-                user_telegram_id=user_id,
-                limit=memory_limit,
-            )
-        else:
-            user_memory = (
-                "User ID mavjud emas. "
-                "Private memory mavjud emas."
-            )
+        user_memory = await retrieve_user_memory(
+            user_telegram_id=user_id,
+            limit=memory_limit,
+        )
 
-        return {
-            "conversation": conversation,
-            "user_memory": user_memory,
-            "group_memory": (
-                "Bu private chat. "
-                "Group memory ishlatilmaydi."
-            ),
-        }
+    else:
 
-    # ============================================================
-    # GROUP CHAT
-    # ============================================================
+        user_memory = (
+            "User ID mavjud emas. "
+            "User memory topilmadi."
+        )
 
-    group_memory = await retrieve_group_memory(
-        group_telegram_id=group_id,
-        limit=memory_limit,
-    )
+    # =========================================================
+    # GROUP MEMORY
+    # =========================================================
+
+    if group_id is not None:
+
+        group_memory = await retrieve_group_memory(
+            group_telegram_id=group_id,
+            limit=memory_limit,
+        )
+
+    else:
+
+        group_memory = (
+            "Bu private chat. "
+            "Group memory mavjud emas."
+        )
+
+    # =========================================================
+    # FINAL CONTEXT
+    # =========================================================
+    #
+    # Muhim o'zgarish:
+    #
+    # OLD:
+    # GROUP → PRIVATE USER MEMORY HIDDEN
+    #
+    # NEW:
+    # GROUP → USER MEMORY + GROUP MEMORY + CHAT HISTORY
+    #
+    # =========================================================
 
     return {
         "conversation": conversation,
 
-        # --------------------------------------------------------
-        # MUHIM PRIVACY QOIDASI
-        # --------------------------------------------------------
-        #
-        # User private memory groupga o'tmaydi.
-        #
-        "user_memory": (
-            "PRIVATE USER MEMORY HIDDEN IN GROUP CONTEXT."
-        ),
+        "user_memory": user_memory,
 
         "group_memory": group_memory,
     }
