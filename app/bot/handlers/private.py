@@ -2,138 +2,120 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.types import Message
 
 from app.agent.telegram_bridge import process_private_message
 from app.services.message_service import message_service
 from app.services.user_service import user_service
 
+
 logger = logging.getLogger("sara.bot.private")
 
-router = Router(name="private_messages")
+router = Router(name="private")
 
 
-def looks_like_question(text: str) -> bool:
-    """
-    Xabar savolga o'xshaydimi?
-    """
+# ============================================================
+# HELPERS
+# ============================================================
 
-    text = text.strip().lower()
+def _get_text(message: Message) -> str:
+    return (
+        message.text
+        or message.caption
+        or ""
+    ).strip()
 
-    if not text:
+
+async def _is_reply_to_sara(
+    bot: Bot,
+    message: Message,
+) -> bool:
+
+    reply = message.reply_to_message
+
+    if reply is None:
         return False
 
-    if "?" in text:
-        return True
-
-    question_words = (
-        "nima",
-        "nega",
-        "qanday",
-        "qachon",
-        "qayer",
-        "qayerda",
-        "kim",
-        "kimga",
-        "kimni",
-        "qancha",
-        "qaysi",
-        "mumkinmi",
-        "bilasanmi",
-        "ayt",
-        "aytchi",
-        "what",
-        "why",
-        "how",
-        "when",
-        "where",
-        "who",
-        "which",
-        "can you",
-        "do you",
-        "почему",
-        "как",
-        "когда",
-        "где",
-        "кто",
-        "какой",
-        "можешь",
-    )
-
-    return any(
-        text == word or text.startswith(word + " ")
-        for word in question_words
-    )
-
-
-async def is_reply_to_sara(message: Message) -> bool:
-    """
-    User SARA yuborgan xabarga reply qilganmi?
-    """
-
-    if not message.reply_to_message:
+    if reply.from_user is None:
         return False
 
-    replied_user = message.reply_to_message.from_user
-
-    if replied_user is None:
-        return False
-
-    if not replied_user.is_bot:
+    if not reply.from_user.is_bot:
         return False
 
     try:
-        sara = await message.bot.get_me()
+        me = await bot.get_me()
+
+        return (
+            reply.from_user.id
+            == me.id
+        )
+
     except Exception:
         logger.exception(
-            "SARA get_me failed while checking reply."
+            "Could not check SARA reply."
         )
         return False
 
-    return replied_user.id == sara.id
 
+# ============================================================
+# PRIVATE MESSAGE HANDLER
+# ============================================================
 
-@router.message(
-    lambda message: (
-        message.chat.type == "private"
-        and bool(message.from_user)
-        and bool(message.text)
-    )
-)
-async def handle_private_message(message: Message) -> None:
+@router.message()
+async def private_message_handler(
+    message: Message,
+    bot: Bot,
+) -> None:
 
     if message.from_user is None:
         return
 
-    if not message.text:
-        return
-
-    user = message.from_user
-    chat_id = message.chat.id
-    text = message.text.strip()
+    text = _get_text(message)
 
     if not text:
         return
 
+    user_id = int(
+        message.from_user.id
+    )
+
+    chat_id = int(
+        message.chat.id
+    )
+
+    # ========================================================
+    # USER UPSERT
+    # ========================================================
+
     try:
-
-        # ==================================================
-        # USER
-        # ==================================================
-
-        db_user = await user_service.get_or_create(
-            user
+        await user_service.get_or_create_user(
+            telegram_id=user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            language_code=(
+                message.from_user.language_code
+            ),
+            is_bot=(
+                message.from_user.is_bot
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Could not update user | user=%s",
+            user_id,
         )
 
-        # ==================================================
-        # SAVE USER MESSAGE
-        # ==================================================
+    # ========================================================
+    # SAVE RAW MESSAGE
+    # ========================================================
 
-        saved_message = await message_service.save(
+    try:
+        await message_service.save_message(
             telegram_message_id=message.message_id,
             chat_id=chat_id,
-            user_telegram_id=user.id,
+            user_telegram_id=user_id,
             role="user",
             content=text,
             message_type="text",
@@ -144,162 +126,193 @@ async def handle_private_message(message: Message) -> None:
             ),
             is_bot_message=False,
         )
-
-        # ==================================================
-        # MESSAGE FLAGS
-        # ==================================================
-
-        question = looks_like_question(text)
-
-        reply_to_sara = await is_reply_to_sara(
-            message
+    except Exception:
+        logger.exception(
+            "Could not save private message | "
+            "chat=%s user=%s",
+            chat_id,
+            user_id,
         )
 
-        # ==================================================
-        # AGENT PIPELINE
-        #
-        # Telegram
-        #      ↓
-        # Telegram Bridge
-        #      ↓
-        # Agent Runtime
-        #      ↓
-        # Brain
-        #      ↓
-        # Planner
-        #      ↓
-        # Executor
-        #      ↓
-        # Tools / Memory / Reminder
-        #      ↓
-        # Telegram
-        # ==================================================
+    # ========================================================
+    # REPLY DETECTION
+    # ========================================================
+
+    reply_to_sara = await _is_reply_to_sara(
+        bot,
+        message,
+    )
+
+    # Private chatda SARA xabarni to'g'ridan-to'g'ri
+    # qayta ishlaydi.
+    sara_called = True
+
+    # ========================================================
+    # AGENT
+    # ========================================================
+
+    try:
 
         result = await process_private_message(
-            message=message,
-            sara_called=True,
+            message,
+            text=text,
+            sara_called=sara_called,
             is_reply_to_sara=reply_to_sara,
             extra_flags={
-                "source": "telegram_private",
+                "source": "private_handler",
+                "source_message_id": message.message_id,
 
-                "source_message_id": saved_message.id,
+                "is_question": (
+                    "?" in text
+                ),
 
-                "is_question": question,
-
-                # Private user memory ishlaydi.
+                # ------------------------------------------------
+                # MEMORY
+                # ------------------------------------------------
                 "allow_user_memory": True,
-
-                # Conversation memory ishlaydi.
                 "allow_conversation_memory": True,
-
-                # User ma'lumotlarini uzoq muddat
-                # eslab qolish uchun signal.
                 "remember_context": True,
 
-                # Private chatda to'liq user scope.
-                "memory_scope": "user_and_conversation",
+                "memory_scope": (
+                    "user_and_conversation"
+                ),
+
+                # ------------------------------------------------
+                # PRIVATE CHAT
+                # ------------------------------------------------
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "is_private": True,
+                "is_group": False,
             },
         )
 
-        # ==================================================
-        # AGENT RESULT
-        # ==================================================
+    except Exception as exc:
 
-        if not result.success:
-
-            logger.error(
-                "Private Agent failed | "
-                "user=%s | chat=%s | error=%s",
-                user.id,
-                chat_id,
-                result.error,
-            )
-
-            await message.answer(
-                "Hozir xabarni qayta ishlashda muammo yuz berdi. "
-                "Birozdan keyin yana urinib ko'r."
-            )
-
-            return
-
-        # Agent javob bermaslikka qaror qilgan bo'lishi mumkin.
-        if not result.should_send:
-
-            logger.debug(
-                "Private Agent ignored message | "
-                "user=%s | chat=%s",
-                user.id,
-                chat_id,
-            )
-
-            return
-
-        answer = (
-            result.response_text or ""
-        ).strip()
-
-        if not answer:
-
-            logger.warning(
-                "Private Agent returned empty response | "
-                "user=%s | chat=%s",
-                user.id,
-                chat_id,
-            )
-
-            return
-
-        # ==================================================
-        # SAVE ASSISTANT MESSAGE
-        # ==================================================
-        #
-        # Muhim:
-        # Telegram yuborishni Executor/Telegram Tool qiladi.
-        # Bu handler yana send_answer() qilmaydi.
-        # Shunday qilib DOUBLE MESSAGE bo'lmaydi.
-        #
-
-        await message_service.save(
-            telegram_message_id=None,
-            chat_id=chat_id,
-            user_telegram_id=None,
-            role="assistant",
-            content=answer,
-            message_type="text",
-            reply_to_message_id=message.message_id,
-            is_bot_message=True,
-        )
-
-        logger.info(
-            "Private Agent response processed | "
-            "user=%s | chat=%s | action=%s",
-            user.id,
+        logger.exception(
+            "SARA private Agent failed | "
+            "chat=%s user=%s",
             chat_id,
-            getattr(
-                result.decision,
-                "action",
-                None,
-            ),
+            user_id,
         )
+
+        return
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+
+    if not result:
+        return
+
+    if not result.success:
+        logger.warning(
+            "Private Agent returned failure | "
+            "chat=%s user=%s error=%s",
+            chat_id,
+            user_id,
+            result.error,
+        )
+        return
+
+    if not result.should_send:
+        return
+
+    response_text = (
+        result.response_text
+        or ""
+    ).strip()
+
+    if not response_text:
+        return
+
+    # ========================================================
+    # IMPORTANT:
+    #
+    # Executor/Agent response yuborgan bo'lishi mumkin.
+    #
+    # Agar Executor allaqachon Telegram'ga yuborgan bo'lsa,
+    # handler ikkinchi marta yubormaydi.
+    # ========================================================
+
+    execution = getattr(
+        result,
+        "agent_result",
+        None,
+    )
+
+    execution_result = getattr(
+        execution,
+        "execution",
+        None,
+    )
+
+    already_sent = False
+
+    if execution_result is not None:
+
+        metadata = getattr(
+            execution_result,
+            "metadata",
+            {},
+        )
+
+        if isinstance(
+            metadata,
+            dict,
+        ):
+            already_sent = bool(
+                metadata.get(
+                    "telegram_sent",
+                    False,
+                )
+            )
+
+    if already_sent:
+        return
+
+    # ========================================================
+    # FALLBACK SEND
+    # ========================================================
+
+    try:
+
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=response_text,
+        )
+
+        # ====================================================
+        # SAVE SARA RESPONSE
+        # ====================================================
+
+        try:
+            await message_service.save_message(
+                telegram_message_id=sent.message_id,
+                chat_id=chat_id,
+                user_telegram_id=user_id,
+                role="assistant",
+                content=response_text,
+                message_type="text",
+                reply_to_message_id=(
+                    message.message_id
+                ),
+                is_bot_message=True,
+            )
+        except Exception:
+            logger.exception(
+                "Could not save SARA private response."
+            )
 
     except Exception:
 
         logger.exception(
-            "Private message processing failed | "
-            "user=%s | chat=%s",
-            user.id,
+            "Could not send private SARA response | "
+            "chat=%s",
             chat_id,
         )
 
-        try:
 
-            await message.answer(
-                "Hozir xabarni qayta ishlashda muammo yuz berdi. "
-                "Birozdan keyin yana urinib ko'r."
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Private error message failed."
-        )
+__all__ = [
+    "router",
+    ]
