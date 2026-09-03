@@ -12,9 +12,7 @@ from app.agent.bot_interaction import (
 )
 from app.agent.loop_guard import loop_guard
 from app.agent.proactive import proactive_agent
-from app.agent.runtime import agent_runtime
-from app.ai.engine import ai_engine
-from app.bot.sender import send_answer
+from app.agent.group_agent import group_agent
 from app.services.group_service import group_service
 from app.services.message_service import message_service
 from app.services.user_service import user_service
@@ -82,18 +80,24 @@ async def is_sara_called(
     if not text:
         return False
 
+    # "sara" yozilgan bo'lsa
     if SARA_PATTERN.search(text):
         return True
 
+    # @sara yozilgan bo'lsa
     username = await get_sara_username(
         message
     )
 
     if username:
 
-        if f"@{username.lower()}" in text.lower():
+        if (
+            f"@{username.lower()}"
+            in text.lower()
+        ):
             return True
 
+    # SARA xabariga reply bo'lsa
     if message.reply_to_message:
 
         replied_user = (
@@ -152,6 +156,7 @@ def clean_message(
 
     text = message.text or ""
 
+    # sara so'zini olib tashlash
     text = SARA_PATTERN.sub(
         "",
         text,
@@ -238,7 +243,6 @@ def looks_like_question(
 # GROUP MESSAGE
 # ============================================================
 
-
 async def process_group_message(
     message: Message,
 ) -> None:
@@ -255,12 +259,16 @@ async def process_group_message(
     try:
 
         # ====================================================
-        # USER + GROUP
+        # USER
         # ====================================================
 
         db_user = await user_service.get_or_create(
             user
         )
+
+        # ====================================================
+        # GROUP
+        # ====================================================
 
         db_group = await group_service.get_or_create(
             message.chat
@@ -338,6 +346,14 @@ async def process_group_message(
         )
 
         if not decision.should_respond:
+
+            logger.debug(
+                "Proactive Agent decided to ignore | "
+                "chat=%s | reason=%s",
+                chat_id,
+                decision.reason,
+            )
+
             return
 
         # ====================================================
@@ -348,14 +364,17 @@ async def process_group_message(
             chat_id=chat_id,
             is_bot_message=bot_message,
         ):
+
             logger.warning(
-                "Response blocked by LoopGuard | chat=%s",
+                "Response blocked by LoopGuard | "
+                "chat=%s",
                 chat_id,
             )
+
             return
 
         # ====================================================
-        # CLEAN TEXT
+        # CLEAN MESSAGE
         # ====================================================
 
         cleaned_text = clean_message(
@@ -379,37 +398,82 @@ async def process_group_message(
                 )
 
         # ====================================================
-        # AGENT RUNTIME
+        # AGENT
         # ====================================================
+        #
+        # Bu yerda endi:
+        #
+        # Runtime
+        #   ↓
+        # Brain
+        #   ↓
+        # Planner
+        #   ↓
+        # Executor
+        #
+        # ishlaydi.
+        #
 
-        agent_context = await agent_runtime.prepare(
+        result = await group_agent.process(
             message=message,
-            user_id=db_user.telegram_id,
-            group_id=db_group.telegram_id,
             sara_called=called,
-            is_question=question,
             is_reply_to_sara=reply_to_sara,
-        )
+            proactive_allowed=True,
+            activity_context={
+                "source": "telegram_group",
 
-        logger.debug(
-            "Group Agent Runtime | chat=%s | context=%s",
-            chat_id,
-            agent_context,
+                "source_message_id": saved_message.id,
+
+                "cleaned_text": cleaned_text,
+
+                "is_question": question,
+
+                "is_bot_message": bot_message,
+
+                # User memory guruh agentiga beriladi.
+                "allow_user_memory": True,
+
+                # Group memory ham beriladi.
+                "allow_group_memory": True,
+
+                # Conversation memory.
+                "allow_conversation_memory": True,
+
+                # Kelajakdagi long-term memory.
+                "remember_context": True,
+
+                # User + Group + Conversation.
+                "memory_scope": (
+                    "user_and_group_and_conversation"
+                ),
+            },
         )
 
         # ====================================================
-        # AI
+        # AGENT RESULT
         # ====================================================
 
-        answer = await ai_engine.generate(
-            user_text=cleaned_text,
-            chat_id=chat_id,
-            user_id=db_user.telegram_id,
-            group_id=db_group.telegram_id,
-            source_message_id=saved_message.id,
-        )
+        if not result.success:
 
-        if not answer or not answer.strip():
+            logger.error(
+                "Group Agent failed | "
+                "chat=%s | user=%s | error=%s",
+                chat_id,
+                user.id,
+                result.error,
+            )
+
+            return
+
+        if not result.should_send:
+
+            return
+
+        answer = (
+            result.response_text or ""
+        ).strip()
+
+        if not answer:
             return
 
         # ====================================================
@@ -435,8 +499,12 @@ async def process_group_message(
             )
 
         # ====================================================
-        # SAVE AI MESSAGE
+        # SAVE ASSISTANT MESSAGE
         # ====================================================
+        #
+        # Telegram Tool orqali javob yuboriladi.
+        # Bu yerda faqat DB historyga yozamiz.
+        #
 
         await message_service.save(
             telegram_message_id=None,
@@ -449,23 +517,16 @@ async def process_group_message(
             is_bot_message=True,
         )
 
-        # ====================================================
-        # SEND
-        # ====================================================
-
-        await send_answer(
-            bot=message.bot,
-            chat_id=chat_id,
-            text=answer,
-            reply_to_message_id=message.message_id,
-        )
-
         logger.info(
-            "Group AI response sent | "
-            "chat=%s | user=%s | reason=%s",
+            "Group Agent response processed | "
+            "chat=%s | user=%s | action=%s",
             chat_id,
             user.id,
-            decision.reason,
+            getattr(
+                result.decision,
+                "action",
+                None,
+            ),
         )
 
     except Exception:
@@ -494,7 +555,6 @@ async def process_group_message(
 # TELEGRAM HANDLER
 # ============================================================
 
-
 @router.message(
     lambda message: (
         message.chat.type
@@ -509,4 +569,4 @@ async def handle_group_message(
 
     await process_group_message(
         message
-        )
+                )
