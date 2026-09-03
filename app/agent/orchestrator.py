@@ -7,7 +7,6 @@ from typing import Any
 from app.agent.brain import (
     ActionType,
     BrainDecision,
-    BrainInput,
     sara_brain,
 )
 from app.agent.executor import (
@@ -29,6 +28,7 @@ logger = logging.getLogger("sara.agent.orchestrator")
 # ============================================================
 # RESULT
 # ============================================================
+
 
 @dataclass
 class AgentRunResult:
@@ -52,6 +52,7 @@ class AgentRunResult:
 # ============================================================
 # ORCHESTRATOR
 # ============================================================
+
 
 class SaraOrchestrator:
 
@@ -101,16 +102,12 @@ class SaraOrchestrator:
                 chat_id=chat_id,
                 user_id=user_id,
                 group_id=group_id,
-
                 is_private=is_private,
                 is_group=is_group,
-
                 is_bot_message=is_bot_message,
-
                 sara_called=sara_called,
                 is_reply_to_sara=is_reply_to_sara,
                 is_question=is_question,
-
                 proactive_allowed=proactive_allowed,
             )
 
@@ -120,57 +117,53 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 2. CONTEXT
+            # 2. BRAIN
+            #
+            # Brain API:
+            #
+            #     sara_brain.think(...)
+            #
+            # BrainInput emas.
             # ==================================================
 
-            agent_context = self._runtime_to_context(
-                runtime=runtime,
-                extra_flags=flags,
+            contains_media = bool(
+                flags.get(
+                    "contains_media",
+                    False,
+                )
             )
 
-            # ==================================================
-            # 3. BRAIN INPUT
-            # ==================================================
+            is_command = bool(
+                flags.get(
+                    "is_command",
+                    False,
+                )
+            )
 
-            brain_input = BrainInput(
-                context=agent_context,
+            decision = sara_brain.think(
+                context=runtime,
                 user_text=user_text,
-                flags={
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "group_id": group_id,
-
-                    "is_group": is_group,
-                    "is_private": is_private,
-                    "is_bot_message": is_bot_message,
-
-                    "sara_called": sara_called,
-                    "is_reply_to_sara": is_reply_to_sara,
-                    "is_question": is_question,
-
-                    "proactive_allowed": (
-                        proactive_allowed
-                    ),
-
-                    **flags,
-                },
-            )
-
-            # ==================================================
-            # 4. BRAIN
-            # ==================================================
-
-            decision = await sara_brain.decide(
-                brain_input
+                is_command=is_command,
+                contains_media=contains_media,
             )
 
             logger.info(
-                "Brain decision | chat=%s | user=%s | "
-                "action=%s | priority=%s | confidence=%.2f",
+                "Brain decision | "
+                "chat=%s | user=%s | "
+                "action=%s | priority=%s | "
+                "confidence=%.2f",
                 chat_id,
                 user_id,
-                getattr(decision, "action", None),
-                getattr(decision, "priority", None),
+                getattr(
+                    decision.action,
+                    "value",
+                    decision.action,
+                ),
+                getattr(
+                    decision.priority,
+                    "value",
+                    decision.priority,
+                ),
                 float(
                     getattr(
                         decision,
@@ -182,7 +175,7 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 5. IGNORE
+            # 3. IGNORE
             # ==================================================
 
             if not decision.should_respond:
@@ -209,7 +202,7 @@ class SaraOrchestrator:
                 )
 
             # ==================================================
-            # 6. AI
+            # 4. AI
             # ==================================================
 
             response_text = ""
@@ -235,30 +228,51 @@ class SaraOrchestrator:
                         is_question=is_question,
                         extra_flags={
                             **flags,
-                            "brain_action": str(
-                                decision.action
+
+                            "brain_action": (
+                                decision.action.value
+                                if hasattr(
+                                    decision.action,
+                                    "value",
+                                )
+                                else str(
+                                    decision.action
+                                )
                             ),
-                            "brain_priority": str(
-                                decision.priority
+
+                            "brain_priority": (
+                                decision.priority.value
+                                if hasattr(
+                                    decision.priority,
+                                    "value",
+                                )
+                                else str(
+                                    decision.priority
+                                )
                             ),
-                            "brain_confidence": getattr(
-                                decision,
-                                "confidence",
-                                0.0,
+
+                            "brain_confidence": (
+                                decision.confidence
                             ),
-                            "brain_reason": getattr(
-                                decision,
-                                "reason",
-                                "",
+
+                            "brain_reason": (
+                                decision.reason
                             ),
+
                             "proactive_allowed": (
                                 proactive_allowed
                             ),
+
                             "agent_context": (
                                 runtime.agent_context
                             ),
+
                             "privacy_context": (
                                 runtime.privacy_context
+                            ),
+
+                            "brain_metadata": (
+                                decision.metadata
                             ),
                         },
                     )
@@ -269,7 +283,7 @@ class SaraOrchestrator:
                 ).strip()
 
             # ==================================================
-            # 7. PLAN
+            # 5. PLAN
             # ==================================================
 
             plan = await sara_planner.create_plan(
@@ -285,7 +299,9 @@ class SaraOrchestrator:
                     "is_private": is_private,
                     "is_bot_message": is_bot_message,
                     "sara_called": sara_called,
-                    "is_reply_to_sara": is_reply_to_sara,
+                    "is_reply_to_sara": (
+                        is_reply_to_sara
+                    ),
                     "is_question": is_question,
                     "proactive_allowed": (
                         proactive_allowed
@@ -295,7 +311,7 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 8. ATTACH RUNTIME
+            # 6. ATTACH RUNTIME DATA
             # ==================================================
 
             self._attach_runtime_data(
@@ -311,7 +327,7 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 9. EXECUTE
+            # 7. EXECUTE
             # ==================================================
 
             execution = await sara_executor.execute(
@@ -339,7 +355,7 @@ class SaraOrchestrator:
                 response_text = execution_response
 
             # ==================================================
-            # 10. SEND POLICY
+            # 8. SEND POLICY
             # ==================================================
 
             should_send = bool(
@@ -352,7 +368,7 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 11. FINALIZE
+            # 9. FINALIZE
             # ==================================================
 
             await runtime.finalize(
@@ -361,7 +377,7 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 12. STATS
+            # 10. STATS
             # ==================================================
 
             if execution_success:
@@ -382,21 +398,39 @@ class SaraOrchestrator:
                         if execution_success
                         else "execution_failed"
                     ),
-                    "brain_action": str(
-                        decision.action
+
+                    "brain_action": (
+                        decision.action.value
+                        if hasattr(
+                            decision.action,
+                            "value",
+                        )
+                        else str(
+                            decision.action
+                        )
                     ),
-                    "brain_priority": str(
-                        decision.priority
+
+                    "brain_priority": (
+                        decision.priority.value
+                        if hasattr(
+                            decision.priority,
+                            "value",
+                        )
+                        else str(
+                            decision.priority
+                        )
                     ),
-                    "brain_confidence": getattr(
-                        decision,
-                        "confidence",
-                        0.0,
+
+                    "brain_confidence": (
+                        decision.confidence
                     ),
-                    "brain_reason": getattr(
-                        decision,
-                        "reason",
-                        "",
+
+                    "brain_reason": (
+                        decision.reason
+                    ),
+
+                    "brain_metadata": (
+                        decision.metadata
                     ),
                 },
             )
@@ -420,7 +454,9 @@ class SaraOrchestrator:
                         response_text="",
                         success=False,
                     )
+
                 except Exception:
+
                     logger.exception(
                         "Runtime error finalization failed."
                     )
@@ -432,6 +468,7 @@ class SaraOrchestrator:
                 error=str(exc),
                 metadata={
                     "status": "error",
+                    "error_type": type(exc).__name__,
                 },
             )
 
@@ -517,24 +554,38 @@ class SaraOrchestrator:
                 ),
                 "response_text": response_text,
 
-                "brain_action": str(
-                    decision.action
+                "brain_action": (
+                    decision.action.value
+                    if hasattr(
+                        decision.action,
+                        "value",
+                    )
+                    else str(
+                        decision.action
+                    )
                 ),
 
-                "brain_priority": str(
-                    decision.priority
+                "brain_priority": (
+                    decision.priority.value
+                    if hasattr(
+                        decision.priority,
+                        "value",
+                    )
+                    else str(
+                        decision.priority
+                    )
                 ),
 
-                "brain_confidence": getattr(
-                    decision,
-                    "confidence",
-                    0.0,
+                "brain_confidence": (
+                    decision.confidence
                 ),
 
-                "brain_reason": getattr(
-                    decision,
-                    "reason",
-                    "",
+                "brain_reason": (
+                    decision.reason
+                ),
+
+                "brain_metadata": (
+                    decision.metadata
                 ),
             }
         )
@@ -566,6 +617,8 @@ class SaraOrchestrator:
 
             "is_group": runtime.is_group,
             "is_private": runtime.is_private,
+
+            "is_bot": runtime.is_bot,
             "is_bot_message": runtime.is_bot_message,
 
             "sara_called": runtime.sara_called,
@@ -649,6 +702,7 @@ class SaraOrchestrator:
 # GLOBAL
 # ============================================================
 
+
 sara_orchestrator = SaraOrchestrator()
 
 
@@ -656,4 +710,4 @@ __all__ = [
     "AgentRunResult",
     "SaraOrchestrator",
     "sara_orchestrator",
-            ]
+                ]
