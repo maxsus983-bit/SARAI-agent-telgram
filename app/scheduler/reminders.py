@@ -8,371 +8,372 @@ from zoneinfo import ZoneInfo
 from app.config.settings import settings
 
 
-# ============================================================
-# REMINDER DATA
-# ============================================================
-
 @dataclass(slots=True)
 class ParsedReminder:
     text: str
     remind_at: datetime
 
 
-# ============================================================
-# TIMEZONE
-# ============================================================
-
 def _timezone() -> ZoneInfo:
     return ZoneInfo(settings.timezone)
 
 
-# ============================================================
-# FORMAT TIME
-# ============================================================
-
 def format_reminder_time(dt: datetime) -> str:
-    """
-    Reminder vaqtini odamga tushunarli ko'rinishga keltiradi.
-    """
-
+    """Reminder vaqtini foydalanuvchiga chiroyli ko‘rsatish."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_timezone())
 
     dt = dt.astimezone(_timezone())
-
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
-# ============================================================
-# TEXT CLEANUP
-# ============================================================
-
 def _clean_reminder_text(text: str) -> str:
-    """
-    Reminder matnidan vaqt haqidagi qismini olib tashlaydi.
-    """
+    """Reminder matnini tozalash."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-        flags=re.UNICODE,
-    ).strip()
-
-    # Oxiridagi "eslat", "eslatib qo'y", "eslatib qo‘y"
-    text = re.sub(
+    patterns = [
         r"\s+(?:menga\s+)?eslat(?:ib)?\s*(?:qo['’`]?y)?[.!]?$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = re.sub(
         r"\s+(?:menga\s+)?eslat[.!]?$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    ]
+
+    for pattern in patterns:
+        text = re.sub(
+            pattern,
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
 
     return text.strip(" .,!?")
 
 
-# ============================================================
-# PARSE REMINDER
-# ============================================================
+
+def _today_at(hour: int, minute: int) -> datetime:
+    now = datetime.now(_timezone())
+
+    return now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _next_clock_time(hour: int, minute: int) -> datetime:
+    now = datetime.now(_timezone())
+
+    target = now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if target <= now:
+        target += timedelta(days=1)
+
+    return target
+
 
 def parse_reminder(text: str) -> ParsedReminder | None:
     """
-    Uzbek tilidagi oddiy natural-language reminderlarni
-    datetime'ga aylantiradi.
+    Oddiy Uzbek reminder gaplarini parse qiladi.
 
-    Qo'llab-quvvatlanadi:
+    Misollar:
 
-        10 daqiqadan keyin suv ichishni eslat
-        1 soatdan keyin menga yozishni eslat
-        30 minutdan keyin ...
-        2 kundan keyin ...
-        ertaga soat 10:00 da ...
-        ertaga 10:00 da ...
-        bugun 20:30 da ...
-        soat 18:00 da ...
-        18:00 da ...
+        10 daqiqadan keyin menga eslat
+        2 soatdan keyin menga eslat
+        1 kundan keyin eslat
+        bugun 20:00 da eslat
+        ertaga 09:30 da eslat
+        soat 18:00 da eslat
+
+    Natija:
+        ParsedReminder | None
     """
 
-    if not text:
-        return None
-
-    original = str(text).strip()
+    original = str(text or "").strip()
 
     if not original:
         return None
 
+    lowered = original.lower().strip()
+
     now = datetime.now(_timezone())
 
-    # ========================================================
-    # 1. "X DAQIQA / SOAT / KUN DAN KEYIN"
-    # ========================================================
+    # ---------------------------------------------------------
+    # 1. N DAQIQA / SOAT / KUN / HAFTADAN KEYIN
+    # ---------------------------------------------------------
 
-    relative_pattern = re.compile(
-        r"^\s*"
-        r"(?P<amount>\d+(?:[.,]\d+)?)"
-        r"\s*"
-        r"(?P<unit>"
-        r"daqiqa|daqiqadan|"
-        r"minut|minutdan|"
-        r"soat|soatdan|"
-        r"kun|kundan|"
-        r"hafta|haftadan"
-        r")"
-        r"\s*"
-        r"keyin"
-        r"(?:\s+da)?"
-        r"\s*"
-        r"(?P<message>.*)"
-        r"$",
-        re.IGNORECASE,
-    )
+    relative_patterns = [
+        (
+            r"(\d+)\s*(?:daqiqa|minut|minute)\s*(?:dan\s*)?(?:keyin|so['’`]?ng)",
+            "minutes",
+        ),
+        (
+            r"(\d+)\s*(?:soat|hour|hours)\s*(?:dan\s*)?(?:keyin|so['’`]?ng)",
+            "hours",
+        ),
+        (
+            r"(\d+)\s*(?:kun|days?)\s*(?:dan\s*)?(?:keyin|so['’`]?ng)",
+            "days",
+        ),
+        (
+            r"(\d+)\s*(?:hafta|weeks?)\s*(?:dan\s*)?(?:keyin|so['’`]?ng)",
+            "weeks",
+        ),
+    ]
 
-    match = relative_pattern.match(original)
-
-    if match:
-        amount = float(
-            match.group("amount").replace(",", ".")
+    for pattern, unit in relative_patterns:
+        match = re.search(
+            pattern,
+            lowered,
+            flags=re.IGNORECASE,
         )
 
-        unit = match.group("unit").lower()
-        message = match.group("message").strip()
+        if not match:
+            continue
 
-        if "daqiqa" in unit or "minut" in unit:
-            remind_at = now + timedelta(
-                minutes=amount
-            )
+        amount = int(match.group(1))
 
-        elif "soat" in unit:
-            remind_at = now + timedelta(
-                hours=amount
-            )
-
-        elif "kun" in unit:
-            remind_at = now + timedelta(
-                days=amount
-            )
-
-        elif "hafta" in unit:
-            remind_at = now + timedelta(
-                weeks=amount
-            )
-
-        else:
+        if amount <= 0:
             return None
 
-        message = _clean_reminder_text(message)
+        if unit == "minutes":
+            remind_at = now + timedelta(minutes=amount)
 
-        if not message:
-            message = "Reminder"
+        elif unit == "hours":
+            remind_at = now + timedelta(hours=amount)
+
+        elif unit == "days":
+            remind_at = now + timedelta(days=amount)
+
+        else:
+            remind_at = now + timedelta(weeks=amount)
+
+        reminder_text = _clean_reminder_text(original)
+
+        if not reminder_text:
+            reminder_text = "Reminder"
 
         return ParsedReminder(
-            text=message,
+            text=reminder_text,
             remind_at=remind_at,
         )
 
-    # ========================================================
-    # 2. TIME EXTRACTOR
-    # ========================================================
+    # ---------------------------------------------------------
+    # 2. BUGUN / ERTAGA + SOAT
+    # ---------------------------------------------------------
 
-    time_pattern = re.compile(
-        r"(?:"
-        r"soat\s*"
-        r")?"
-        r"(?P<hour>\d{1,2})"
-        r"[:.](?P<minute>\d{2})"
-        r"(?:\s*(?P<ampm>am|pm))?"
-        r"\s*(?:da)?",
-        re.IGNORECASE,
+    clock_pattern = re.compile(
+        r"(?:soat\s*)?(\d{1,2})[:.](\d{2})"
+        r"(?:\s*(?:da|ga))?",
+        flags=re.IGNORECASE,
     )
 
-    time_match = time_pattern.search(original)
+    clock_match = clock_pattern.search(lowered)
 
-    # ========================================================
-    # 3. "ERTAGA"
-    # ========================================================
+    if clock_match:
+        hour = int(clock_match.group(1))
+        minute = int(clock_match.group(2))
 
-    if re.search(
-        r"\bertaga\b",
-        original,
-        re.IGNORECASE,
-    ):
-        if time_match:
-            hour = int(time_match.group("hour"))
-            minute = int(time_match.group("minute"))
-
-            ampm = time_match.group("ampm")
-
-            if ampm:
-                ampm = ampm.lower()
-
-                if ampm == "pm" and hour < 12:
-                    hour += 12
-
-                if ampm == "am" and hour == 12:
-                    hour = 0
-
-            if hour > 23 or minute > 59:
-                return None
-
-            target_date = now.date() + timedelta(days=1)
-
-            remind_at = datetime(
-                target_date.year,
-                target_date.month,
-                target_date.day,
-                hour,
-                minute,
-                tzinfo=_timezone(),
-            )
-
-            message = original[
-                :time_match.start()
-            ] + original[
-                time_match.end():
-            ]
-
-            message = re.sub(
-                r"\bertaga\b",
-                "",
-                message,
-                flags=re.IGNORECASE,
-            )
-
-            message = _clean_reminder_text(message)
-
-            if not message:
-                message = "Reminder"
-
-            return ParsedReminder(
-                text=message,
-                remind_at=remind_at,
-            )
-
-    # ========================================================
-    # 4. "BUGUN"
-    # ========================================================
-
-    if re.search(
-        r"\bbugun\b",
-        original,
-        re.IGNORECASE,
-    ):
-        if time_match:
-            hour = int(time_match.group("hour"))
-            minute = int(time_match.group("minute"))
-
-            ampm = time_match.group("ampm")
-
-            if ampm:
-                ampm = ampm.lower()
-
-                if ampm == "pm" and hour < 12:
-                    hour += 12
-
-                if ampm == "am" and hour == 12:
-                    hour = 0
-
-            if hour > 23 or minute > 59:
-                return None
-
-            remind_at = datetime(
-                now.year,
-                now.month,
-                now.day,
-                hour,
-                minute,
-                tzinfo=_timezone(),
-            )
-
-            # Agar bugungi vaqt o'tib ketgan bo'lsa,
-            # ertaga deb olish.
-            if remind_at <= now:
-                remind_at += timedelta(days=1)
-
-            message = (
-                original[:time_match.start()]
-                + original[time_match.end():]
-            )
-
-            message = re.sub(
-                r"\bbugun\b",
-                "",
-                message,
-                flags=re.IGNORECASE,
-            )
-
-            message = _clean_reminder_text(message)
-
-            if not message:
-                message = "Reminder"
-
-            return ParsedReminder(
-                text=message,
-                remind_at=remind_at,
-            )
-
-    # ========================================================
-    # 5. FAQAT "SOAT 18:00 DA ..."
-    # ========================================================
-
-    if time_match:
-        hour = int(time_match.group("hour"))
-        minute = int(time_match.group("minute"))
-
-        ampm = time_match.group("ampm")
-
-        if ampm:
-            ampm = ampm.lower()
-
-            if ampm == "pm" and hour < 12:
-                hour += 12
-
-            if ampm == "am" and hour == 12:
-                hour = 0
-
-        if hour > 23 or minute > 59:
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
             return None
 
-        remind_at = datetime(
-            now.year,
-            now.month,
-            now.day,
-            hour,
-            minute,
-            tzinfo=_timezone(),
+        if "ertaga" in lowered:
+            base = now + timedelta(days=1)
+
+            remind_at = base.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+
+        elif "bugun" in lowered:
+            remind_at = now.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+
+            # Bugungi vaqt allaqachon o'tgan bo‘lsa,
+            # keyingi kunga o'tkazmaymiz.
+            # Chunki "bugun 08:00" noto‘g‘ri vaqt bo‘lishi mumkin.
+            if remind_at <= now:
+                return None
+
+        else:
+            remind_at = _next_clock_time(
+                hour,
+                minute,
+            )
+
+        reminder_text = _clean_reminder_text(original)
+
+        # "bugun", "ertaga", "soat..." qismlarini matndan olib tashlash
+        reminder_text = re.sub(
+            r"\b(?:bugun|ertaga)\b",
+            "",
+            reminder_text,
+            flags=re.IGNORECASE,
         )
 
-        # Bugungi vaqt o'tib ketgan bo'lsa,
-        # keyingi kun.
-        if remind_at <= now:
-            remind_at += timedelta(days=1)
-
-        message = (
-            original[:time_match.start()]
-            + original[time_match.end():]
+        reminder_text = re.sub(
+            r"\b(?:soat\s*)?\d{1,2}[:.]\d{2}\s*(?:da|ga)?\b",
+            "",
+            reminder_text,
+            flags=re.IGNORECASE,
         )
 
-        message = _clean_reminder_text(message)
+        reminder_text = re.sub(
+            r"\s+",
+            " ",
+            reminder_text,
+        ).strip(" .,!?")
 
-        if not message:
-            message = "Reminder"
+        if not reminder_text:
+            reminder_text = "Reminder"
 
         return ParsedReminder(
-            text=message,
+            text=reminder_text,
+            remind_at=remind_at,
+        )
+
+    # ---------------------------------------------------------
+    # 3. ODDIY "N DAQIQADAN KEYIN"
+    # ---------------------------------------------------------
+
+    simple_match = re.search(
+        r"(\d+)\s*(?:m|min|m\.|daq|daqiqa)\b",
+        lowered,
+    )
+
+    if simple_match and (
+        "keyin" in lowered
+        or "so'ng" in lowered
+        or "so‘ng" in lowered
+    ):
+        amount = int(simple_match.group(1))
+
+        if amount <= 0:
+            return None
+
+        remind_at = now + timedelta(
+            minutes=amount
+        )
+
+        reminder_text = _clean_reminder_text(original)
+
+        if not reminder_text:
+            reminder_text = "Reminder"
+
+        return ParsedReminder(
+            text=reminder_text,
             remind_at=remind_at,
         )
 
     return None
 
 
+# =============================================================
+# COMPATIBILITY HELPERS
+# =============================================================
+#
+# commands.py eski API nomlarini ishlatishi mumkin.
+# Shu sababli ular mavjud bo‘lishi kerak.
+#
+# Asosiy reminder yaratish/bekor qilish ishlarini
+# SchedulerManager bajaradi.
+# =============================================================
+
+
+async def create_reminder(
+    *,
+    owner_telegram_id: int,
+    chat_id: int,
+    text: str,
+    remind_at: datetime,
+):
+    """
+    Compatibility wrapper.
+
+    Reminder yaratish uchun SchedulerManager ishlatiladi.
+    """
+
+    from app.scheduler.manager import scheduler_manager
+
+    return await scheduler_manager.create_reminder(
+        owner_telegram_id=owner_telegram_id,
+        chat_id=chat_id,
+        text=text,
+        remind_at=remind_at,
+    )
+
+
+async def get_reminder_by_id(
+    reminder_id: int,
+    owner_telegram_id: int,
+):
+    """Compatibility wrapper."""
+
+    from app.scheduler.manager import scheduler_manager
+
+    return await scheduler_manager.get_reminder(
+        reminder_id=reminder_id,
+        owner_telegram_id=owner_telegram_id,
+    )
+
+
+async def cancel_reminder_by_id(
+    reminder_id: int,
+    owner_telegram_id: int,
+) -> bool:
+    """
+    commands.py uchun eski API.
+
+    Reminderni faqat uning egasi bekor qila oladi.
+    """
+
+    from app.scheduler.manager import scheduler_manager
+
+    return await scheduler_manager.cancel_reminder(
+        reminder_id=reminder_id,
+        owner_telegram_id=owner_telegram_id,
+    )
+
+
+async def get_user_reminders(
+    owner_telegram_id: int,
+    *,
+    include_completed: bool = False,
+):
+    """Foydalanuvchining reminderlarini olish."""
+
+    from app.scheduler.manager import scheduler_manager
+
+    return await scheduler_manager.get_user_reminders(
+        owner_telegram_id,
+        include_completed=include_completed,
+    )
+
+
+async def get_active_reminders():
+    """Barcha aktiv reminderlarni olish."""
+
+    from app.scheduler.manager import scheduler_manager
+
+    return await scheduler_manager.get_active_reminders()
+
+
 __all__ = [
     "ParsedReminder",
     "parse_reminder",
     "format_reminder_time",
-            ]
+    "create_reminder",
+    "get_reminder_by_id",
+    "cancel_reminder_by_id",
+    "get_user_reminders",
+    "get_active_reminders",
+        ]
