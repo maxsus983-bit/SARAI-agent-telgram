@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent.brain import (
+    ActionType,
     BrainDecision,
     BrainInput,
-    ActionType,
     sara_brain,
 )
 from app.agent.executor import (
@@ -18,9 +18,7 @@ from app.agent.planner import (
     ExecutionPlan,
     sara_planner,
 )
-from app.agent.runtime import (
-    AgentRuntimeContext,
-)
+from app.agent.runtime import AgentRuntimeContext
 from app.ai.engine import ai_engine
 from app.ai.models import AIResponse
 
@@ -28,33 +26,12 @@ from app.ai.models import AIResponse
 logger = logging.getLogger("sara.agent.orchestrator")
 
 
-# ==============================================================
+# ============================================================
 # RESULT
-# ==============================================================
-
+# ============================================================
 
 @dataclass
 class AgentRunResult:
-    """
-    SARA Agent pipeline natijasi.
-
-    Pipeline:
-
-        Telegram
-           ↓
-        Runtime
-           ↓
-        Brain
-           ↓
-        AI Engine
-           ↓
-        Planner
-           ↓
-        Executor
-           ↓
-        Telegram Tool
-    """
-
     success: bool = False
 
     decision: BrainDecision | None = None
@@ -72,39 +49,21 @@ class AgentRunResult:
     )
 
 
-# ==============================================================
+# ============================================================
 # ORCHESTRATOR
-# ==============================================================
-
+# ============================================================
 
 class SaraOrchestrator:
-    """
-    SARA AI Agent Orchestrator.
-
-    Bu klass SARA'ning barcha agent qismlarini birlashtiradi:
-
-        Runtime
-        Brain
-        AI Engine
-        Planner
-        Executor
-
-    Orchestratorning o'zi Telegramga to'g'ridan-to'g'ri
-    xabar yubormaydi.
-
-    Telegram yuborish Executor → Telegram Tool orqali amalga oshadi.
-    """
 
     def __init__(self) -> None:
-
         self.total_runs = 0
         self.successful_runs = 0
         self.failed_runs = 0
         self.ignored_runs = 0
 
-    # ==========================================================
+    # ========================================================
     # PROCESS
-    # ==========================================================
+    # ========================================================
 
     async def process(
         self,
@@ -126,7 +85,7 @@ class SaraOrchestrator:
 
         self.total_runs += 1
 
-        extra_flags = dict(
+        flags = dict(
             extra_flags or {}
         )
 
@@ -142,27 +101,31 @@ class SaraOrchestrator:
                 chat_id=chat_id,
                 user_id=user_id,
                 group_id=group_id,
-                is_group=is_group,
+
                 is_private=is_private,
+                is_group=is_group,
+
                 is_bot_message=is_bot_message,
+
                 sara_called=sara_called,
                 is_reply_to_sara=is_reply_to_sara,
+                is_question=is_question,
+
                 proactive_allowed=proactive_allowed,
             )
 
-            # Prepare runtime state.
             await runtime.prepare(
                 user_text=user_text,
-                extra_flags=extra_flags,
+                extra_flags=flags,
             )
 
             # ==================================================
-            # 2. BUILD AGENT CONTEXT
+            # 2. CONTEXT
             # ==================================================
 
             agent_context = self._runtime_to_context(
                 runtime=runtime,
-                extra_flags=extra_flags,
+                extra_flags=flags,
             )
 
             # ==================================================
@@ -185,14 +148,16 @@ class SaraOrchestrator:
                     "is_reply_to_sara": is_reply_to_sara,
                     "is_question": is_question,
 
-                    "proactive_allowed": proactive_allowed,
+                    "proactive_allowed": (
+                        proactive_allowed
+                    ),
 
-                    **extra_flags,
+                    **flags,
                 },
             )
 
             # ==================================================
-            # 4. BRAIN DECISION
+            # 4. BRAIN
             # ==================================================
 
             decision = await sara_brain.decide(
@@ -200,21 +165,12 @@ class SaraOrchestrator:
             )
 
             logger.info(
-                "Brain decision | chat=%s | user=%s "
-                "| action=%s | priority=%s "
-                "| confidence=%.2f",
+                "Brain decision | chat=%s | user=%s | "
+                "action=%s | priority=%s | confidence=%.2f",
                 chat_id,
                 user_id,
-                getattr(
-                    decision,
-                    "action",
-                    None,
-                ),
-                getattr(
-                    decision,
-                    "priority",
-                    None,
-                ),
+                getattr(decision, "action", None),
+                getattr(decision, "priority", None),
                 float(
                     getattr(
                         decision,
@@ -233,10 +189,14 @@ class SaraOrchestrator:
 
                 self.ignored_runs += 1
 
+                await runtime.finalize(
+                    response_text="",
+                    success=True,
+                )
+
                 return AgentRunResult(
                     success=True,
                     decision=decision,
-                    response_text="",
                     should_send=False,
                     metadata={
                         "status": "ignored",
@@ -249,7 +209,7 @@ class SaraOrchestrator:
                 )
 
             # ==================================================
-            # 6. AI RESPONSE GENERATION
+            # 6. AI
             # ==================================================
 
             response_text = ""
@@ -264,7 +224,9 @@ class SaraOrchestrator:
                         user_id=user_id,
                         user_text=user_text,
                         group_id=group_id,
-                        reply_to_message_id=reply_to_message_id,
+                        reply_to_message_id=(
+                            reply_to_message_id
+                        ),
                         is_group=is_group,
                         is_private=is_private,
                         is_bot_message=is_bot_message,
@@ -272,7 +234,7 @@ class SaraOrchestrator:
                         is_reply_to_sara=is_reply_to_sara,
                         is_question=is_question,
                         extra_flags={
-                            **extra_flags,
+                            **flags,
                             "brain_action": str(
                                 decision.action
                             ),
@@ -292,6 +254,12 @@ class SaraOrchestrator:
                             "proactive_allowed": (
                                 proactive_allowed
                             ),
+                            "agent_context": (
+                                runtime.agent_context
+                            ),
+                            "privacy_context": (
+                                runtime.privacy_context
+                            ),
                         },
                     )
                 )
@@ -301,7 +269,7 @@ class SaraOrchestrator:
                 ).strip()
 
             # ==================================================
-            # 7. PLANNER
+            # 7. PLAN
             # ==================================================
 
             plan = await sara_planner.create_plan(
@@ -319,13 +287,15 @@ class SaraOrchestrator:
                     "sara_called": sara_called,
                     "is_reply_to_sara": is_reply_to_sara,
                     "is_question": is_question,
-                    "proactive_allowed": proactive_allowed,
-                    **extra_flags,
+                    "proactive_allowed": (
+                        proactive_allowed
+                    ),
+                    **flags,
                 },
             )
 
             # ==================================================
-            # 8. MAKE PLAN SELF-CONTAINED
+            # 8. ATTACH RUNTIME
             # ==================================================
 
             self._attach_runtime_data(
@@ -335,20 +305,18 @@ class SaraOrchestrator:
                 chat_id=chat_id,
                 user_id=user_id,
                 group_id=group_id,
-                reply_to_message_id=reply_to_message_id,
+                reply_to_message_id=(
+                    reply_to_message_id
+                ),
             )
 
             # ==================================================
-            # 9. EXECUTOR
+            # 9. EXECUTE
             # ==================================================
 
             execution = await sara_executor.execute(
                 plan
             )
-
-            # ==================================================
-            # 10. EXECUTION RESULT
-            # ==================================================
 
             execution_success = bool(
                 getattr(
@@ -368,11 +336,10 @@ class SaraOrchestrator:
             ).strip()
 
             if execution_response:
-
                 response_text = execution_response
 
             # ==================================================
-            # 11. SHOULD SEND
+            # 10. SEND POLICY
             # ==================================================
 
             should_send = bool(
@@ -385,33 +352,21 @@ class SaraOrchestrator:
             )
 
             # ==================================================
-            # 12. RUNTIME FINALIZATION
+            # 11. FINALIZE
             # ==================================================
 
-            try:
-
-                await runtime.finalize(
-                    response_text=response_text,
-                    success=execution_success,
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Runtime finalization failed | chat=%s",
-                    chat_id,
-                )
+            await runtime.finalize(
+                response_text=response_text,
+                success=execution_success,
+            )
 
             # ==================================================
-            # 13. FINAL RESULT
+            # 12. STATS
             # ==================================================
 
             if execution_success:
-
                 self.successful_runs += 1
-
             else:
-
                 self.failed_runs += 1
 
             return AgentRunResult(
@@ -446,10 +401,6 @@ class SaraOrchestrator:
                 },
             )
 
-        # ======================================================
-        # ERROR
-        # ======================================================
-
         except Exception as exc:
 
             self.failed_runs += 1
@@ -462,18 +413,14 @@ class SaraOrchestrator:
                 group_id,
             )
 
-            # Runtime error state.
             if runtime is not None:
 
                 try:
-
                     await runtime.finalize(
                         response_text="",
                         success=False,
                     )
-
                 except Exception:
-
                     logger.exception(
                         "Runtime error finalization failed."
                     )
@@ -488,21 +435,16 @@ class SaraOrchestrator:
                 },
             )
 
-    # ==========================================================
-    # AI RESPONSE POLICY
-    # ==========================================================
+    # ========================================================
+    # AI POLICY
+    # ========================================================
 
     @staticmethod
     def _requires_ai_response(
         decision: BrainDecision,
     ) -> bool:
-        """
-        Qaysi action uchun LLM javobi kerakligini aniqlaydi.
-        """
 
-        action = decision.action
-
-        return action in {
+        return decision.action in {
             ActionType.RESPOND,
             ActionType.ASK_CLARIFICATION,
             ActionType.CONTINUE_CONVERSATION,
@@ -512,9 +454,9 @@ class SaraOrchestrator:
             ActionType.USE_TOOL,
         }
 
-    # ==========================================================
+    # ========================================================
     # SEND POLICY
-    # ==========================================================
+    # ========================================================
 
     @staticmethod
     def _should_send_after_execution(
@@ -522,10 +464,6 @@ class SaraOrchestrator:
         decision: BrainDecision,
         execution: ExecutionResult,
     ) -> bool:
-        """
-        Executor muvaffaqiyatli bo'lgandan keyin
-        Telegramga yuborish kerakligini aniqlaydi.
-        """
 
         if not getattr(
             execution,
@@ -539,9 +477,9 @@ class SaraOrchestrator:
 
         return True
 
-    # ==========================================================
-    # ATTACH RUNTIME DATA
-    # ==========================================================
+    # ========================================================
+    # ATTACH DATA
+    # ========================================================
 
     @staticmethod
     def _attach_runtime_data(
@@ -554,18 +492,6 @@ class SaraOrchestrator:
         group_id: int | None,
         reply_to_message_id: int | None,
     ) -> None:
-        """
-        Planner yaratgan plan ichiga runtime ma'lumotlarini joylaydi.
-
-        Bu Executor'ga alohida global state kerak bo'lmasligi uchun
-        plan o'zini o'zi yetarli qiladi.
-        """
-
-        if not hasattr(
-            plan,
-            "metadata",
-        ):
-            return
 
         metadata = getattr(
             plan,
@@ -577,6 +503,7 @@ class SaraOrchestrator:
             metadata,
             dict,
         ):
+
             metadata = {}
             plan.metadata = metadata
 
@@ -589,17 +516,21 @@ class SaraOrchestrator:
                     reply_to_message_id
                 ),
                 "response_text": response_text,
+
                 "brain_action": str(
                     decision.action
                 ),
+
                 "brain_priority": str(
                     decision.priority
                 ),
+
                 "brain_confidence": getattr(
                     decision,
                     "confidence",
                     0.0,
                 ),
+
                 "brain_reason": getattr(
                     decision,
                     "reason",
@@ -608,18 +539,7 @@ class SaraOrchestrator:
             }
         )
 
-        # SAVE_MEMORY uchun source text.
-        if not isinstance(
-            getattr(
-                plan,
-                "metadata",
-                None,
-            ),
-            dict,
-        ):
-            return
-
-        plan.metadata.setdefault(
+        metadata.setdefault(
             "source_text",
             getattr(
                 plan,
@@ -628,9 +548,9 @@ class SaraOrchestrator:
             ),
         )
 
-    # ==========================================================
+    # ========================================================
     # RUNTIME → CONTEXT
-    # ==========================================================
+    # ========================================================
 
     @staticmethod
     def _runtime_to_context(
@@ -638,11 +558,8 @@ class SaraOrchestrator:
         runtime: AgentRuntimeContext,
         extra_flags: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Runtime state'ni Brain uchun oddiy dictionaryga aylantiradi.
-        """
 
-        context: dict[str, Any] = {
+        context = {
             "chat_id": runtime.chat_id,
             "user_id": runtime.user_id,
             "group_id": runtime.group_id,
@@ -652,35 +569,46 @@ class SaraOrchestrator:
             "is_bot_message": runtime.is_bot_message,
 
             "sara_called": runtime.sara_called,
-            "is_reply_to_sara": runtime.is_reply_to_sara,
+            "is_reply_to_sara": (
+                runtime.is_reply_to_sara
+            ),
+
+            "is_question": runtime.is_question,
 
             "proactive_allowed": (
                 runtime.proactive_allowed
             ),
-        }
 
-        # ------------------------------------------------------
-        # Agent context
-        # ------------------------------------------------------
+            "agent_context": (
+                runtime.agent_context
+            ),
+
+            "privacy_context": (
+                runtime.privacy_context
+            ),
+
+            "can_use_private_memory": (
+                runtime.can_use_private_memory
+            ),
+
+            "can_use_group_memory": (
+                runtime.can_use_group_memory
+            ),
+        }
 
         try:
 
-            if hasattr(
-                runtime,
-                "build_agent_context",
+            runtime_context = (
+                runtime.build_agent_context()
+            )
+
+            if isinstance(
+                runtime_context,
+                dict,
             ):
-
-                runtime_context = (
-                    runtime.build_agent_context()
+                context.update(
+                    runtime_context
                 )
-
-                if isinstance(
-                    runtime_context,
-                    dict,
-                ):
-                    context.update(
-                        runtime_context
-                    )
 
         except Exception:
 
@@ -688,79 +616,15 @@ class SaraOrchestrator:
                 "Could not build runtime agent context."
             )
 
-        # ------------------------------------------------------
-        # Emotional state
-        # ------------------------------------------------------
-
-        try:
-
-            if hasattr(
-                runtime,
-                "emotional_context",
-            ):
-
-                emotional = getattr(
-                    runtime,
-                    "emotional_context",
-                )
-
-                if isinstance(
-                    emotional,
-                    dict,
-                ):
-                    context[
-                        "emotional_state"
-                    ] = emotional
-
-        except Exception:
-
-            logger.exception(
-                "Could not read emotional context."
-            )
-
-        # ------------------------------------------------------
-        # Relationship
-        # ------------------------------------------------------
-
-        try:
-
-            if hasattr(
-                runtime,
-                "relationship_context",
-            ):
-
-                relationship = getattr(
-                    runtime,
-                    "relationship_context",
-                )
-
-                if isinstance(
-                    relationship,
-                    dict,
-                ):
-                    context[
-                        "relationship"
-                    ] = relationship
-
-        except Exception:
-
-            logger.exception(
-                "Could not read relationship context."
-            )
-
-        # ------------------------------------------------------
-        # Extra flags
-        # ------------------------------------------------------
-
         context.update(
             extra_flags
         )
 
         return context
 
-    # ==========================================================
+    # ========================================================
     # STATS
-    # ==========================================================
+    # ========================================================
 
     def stats(self) -> dict[str, int]:
 
@@ -773,10 +637,6 @@ class SaraOrchestrator:
             "ignored_runs": self.ignored_runs,
         }
 
-    # ==========================================================
-    # RESET STATS
-    # ==========================================================
-
     def reset_stats(self) -> None:
 
         self.total_runs = 0
@@ -785,9 +645,9 @@ class SaraOrchestrator:
         self.ignored_runs = 0
 
 
-# ==============================================================
-# GLOBAL ORCHESTRATOR
-# ==============================================================
+# ============================================================
+# GLOBAL
+# ============================================================
 
 sara_orchestrator = SaraOrchestrator()
 
@@ -796,4 +656,4 @@ __all__ = [
     "AgentRunResult",
     "SaraOrchestrator",
     "sara_orchestrator",
-]
+            ]
