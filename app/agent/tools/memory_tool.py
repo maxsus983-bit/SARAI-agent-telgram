@@ -13,463 +13,380 @@ class MemoryTool:
     SARA Memory Tool.
 
     Vazifalari:
-    - User memory saqlash
-    - Group memory saqlash
-    - User memory qidirish
-    - Group memory qidirish
-    - Memory o'chirish
-    - Memory sonini ko'rish
+      - User memory saqlash
+      - Group memory saqlash
+      - Memory qidirish
+      - Memory olish
+      - Memory o'chirish
+      - Memory tiklash
+      - Memory sonini olish
 
-    Eslatma:
-    Oddiy chat xabarlari ham conversation history orqali
-    alohida saqlanadi. Bu tool esa agentga uzoq muddatli
-    memory bilan ishlash imkonini beradi.
+    Muhim:
+      - API key / token / password kabi secretlar MemoryManager
+        tomonidan saqlanmaydi.
+      - User memory guruh kontekstida ishlatilishi mumkin.
+      - Har bir userning memory'si telegram user ID bilan ajratiladi.
+      - Har bir group memory'si telegram group ID bilan ajratiladi.
     """
 
-    async def save_user_memory(
+    def __init__(self) -> None:
+        self.manager = memory_manager
+
+    # ============================================================
+    # USER MEMORY
+    # ============================================================
+
+    async def save_user(
         self,
         *,
         user_telegram_id: int,
+        memory_type: str,
         content: str,
-        memory_type: str = "IMPORTANT_FACT",
-        importance: float = 0.8,
-        confidence: float = 0.95,
+        importance: float = 0.5,
+        confidence: float = 0.8,
         source_message_id: int | None = None,
     ) -> dict[str, Any]:
-        content = str(content).strip()
 
-        if not content:
-            return {
-                "success": False,
-                "error": "empty_memory",
-            }
+        result = await self.manager.save_user_memory(
+            user_telegram_id=int(user_telegram_id),
+            memory_type=str(memory_type),
+            content=str(content),
+            importance=float(importance),
+            confidence=float(confidence),
+            source_message_id=source_message_id,
+        )
 
-        try:
-            memory = await memory_manager.save_user_memory(
-                user_telegram_id=user_telegram_id,
-                memory_type=memory_type,
-                content=content,
-                importance=importance,
-                confidence=confidence,
-                source_message_id=source_message_id,
-            )
-
-            return {
-                "success": True,
-                "memory_id": getattr(memory, "id", None),
-                "user_telegram_id": user_telegram_id,
-                "memory_type": memory_type,
-                "content": content,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to save user memory | user=%s",
-                user_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    async def save_group_memory(
-        self,
-        *,
-        group_telegram_id: int,
-        content: str,
-        memory_type: str = "GROUP_FACT",
-        importance: float = 0.8,
-        confidence: float = 0.95,
-        source_message_id: int | None = None,
-    ) -> dict[str, Any]:
-        content = str(content).strip()
-
-        if not content:
-            return {
-                "success": False,
-                "error": "empty_memory",
-            }
-
-        try:
-            memory = await memory_manager.save_group_memory(
-                group_telegram_id=group_telegram_id,
-                memory_type=memory_type,
-                content=content,
-                importance=importance,
-                confidence=confidence,
-                source_message_id=source_message_id,
-            )
-
-            return {
-                "success": True,
-                "memory_id": getattr(memory, "id", None),
-                "group_telegram_id": group_telegram_id,
-                "memory_type": memory_type,
-                "content": content,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to save group memory | group=%s",
-                group_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    async def search_user_memory(
-        self,
-        *,
-        user_telegram_id: int,
-        query: str,
-        limit: int = 15,
-    ) -> dict[str, Any]:
-        query = str(query).strip()
-
-        if not query:
-            return {
-                "success": False,
-                "error": "empty_query",
-                "memories": [],
-            }
-
-        try:
-            memories = await memory_manager.search_user_memory(
-                user_telegram_id=user_telegram_id,
-                query=query,
-                limit=limit,
-            )
-
-            return {
-                "success": True,
-                "user_telegram_id": user_telegram_id,
-                "query": query,
-                "count": len(memories),
-                "memories": [
-                    self._serialize_memory(memory)
-                    for memory in memories
-                ],
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to search user memory | user=%s",
-                user_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-                "memories": [],
-            }
-
-    async def search_group_memory(
-        self,
-        *,
-        group_telegram_id: int,
-        query: str,
-        limit: int = 15,
-    ) -> dict[str, Any]:
-        query = str(query).strip()
-
-        if not query:
-            return {
-                "success": False,
-                "error": "empty_query",
-                "memories": [],
-            }
-
-        try:
-            memories = await memory_manager.search_group_memory(
-                group_telegram_id=group_telegram_id,
-                query=query,
-                limit=limit,
-            )
-
-            return {
-                "success": True,
-                "group_telegram_id": group_telegram_id,
-                "query": query,
-                "count": len(memories),
-                "memories": [
-                    self._serialize_memory(memory)
-                    for memory in memories
-                ],
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to search group memory | group=%s",
-                group_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-                "memories": [],
-            }
-
-    async def get_user_memories(
-        self,
-        *,
-        user_telegram_id: int,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        try:
-            memories = await memory_manager.get_user_memories(
-                user_telegram_id=user_telegram_id,
-                limit=limit,
-            )
-
-            return {
-                "success": True,
-                "user_telegram_id": user_telegram_id,
-                "count": len(memories),
-                "memories": [
-                    self._serialize_memory(memory)
-                    for memory in memories
-                ],
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to get user memories | user=%s",
-                user_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-                "memories": [],
-            }
-
-    async def get_group_memories(
-        self,
-        *,
-        group_telegram_id: int,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        try:
-            memories = await memory_manager.get_group_memories(
-                group_telegram_id=group_telegram_id,
-                limit=limit,
-            )
-
-            return {
-                "success": True,
-                "group_telegram_id": group_telegram_id,
-                "count": len(memories),
-                "memories": [
-                    self._serialize_memory(memory)
-                    for memory in memories
-                ],
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to get group memories | group=%s",
-                group_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-                "memories": [],
-            }
-
-    async def forget_user_memory(
-        self,
-        *,
-        user_telegram_id: int,
-        memory_id: int,
-    ) -> dict[str, Any]:
-        try:
-            result = await memory_manager.forget_user_memory(
-                user_telegram_id=user_telegram_id,
-                memory_id=memory_id,
-            )
-
-            return {
-                "success": bool(result),
-                "memory_id": memory_id,
-                "user_telegram_id": user_telegram_id,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to forget user memory | user=%s memory=%s",
-                user_telegram_id,
-                memory_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    async def forget_group_memory(
-        self,
-        *,
-        group_telegram_id: int,
-        memory_id: int,
-    ) -> dict[str, Any]:
-        try:
-            result = await memory_manager.forget_group_memory(
-                group_telegram_id=group_telegram_id,
-                memory_id=memory_id,
-            )
-
-            return {
-                "success": bool(result),
-                "memory_id": memory_id,
-                "group_telegram_id": group_telegram_id,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to forget group memory | group=%s memory=%s",
-                group_telegram_id,
-                memory_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    async def count_user_memory(
-        self,
-        *,
-        user_telegram_id: int,
-    ) -> dict[str, Any]:
-        try:
-            count = await memory_manager.count_user_memory(
-                user_telegram_id=user_telegram_id,
-            )
-
-            return {
-                "success": True,
-                "user_telegram_id": user_telegram_id,
-                "count": count,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to count user memory | user=%s",
-                user_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    async def count_group_memory(
-        self,
-        *,
-        group_telegram_id: int,
-    ) -> dict[str, Any]:
-        try:
-            count = await memory_manager.count_group_memory(
-                group_telegram_id=group_telegram_id,
-            )
-
-            return {
-                "success": True,
-                "group_telegram_id": group_telegram_id,
-                "count": count,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to count group memory | group=%s",
-                group_telegram_id,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
-
-    @staticmethod
-    def _serialize_memory(memory: Any) -> dict[str, Any]:
         return {
-            "id": getattr(memory, "id", None),
-            "memory_type": getattr(memory, "memory_type", None),
-            "content": getattr(memory, "content", ""),
-            "importance": getattr(memory, "importance", None),
-            "confidence": getattr(memory, "confidence", None),
-            "source_message_id": getattr(
-                memory,
-                "source_message_id",
-                None,
-            ),
-            "active": getattr(memory, "active", True),
-            "created_at": (
-                getattr(memory, "created_at", None).isoformat()
-                if getattr(memory, "created_at", None)
-                else None
-            ),
+            "success": bool(result),
+            "type": "user_memory",
+            "memory": result,
         }
 
+    async def search_user(
+        self,
+        *,
+        user_telegram_id: int,
+        query: str = "",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+
+        memories = await self.manager.search_user_memory(
+            user_telegram_id=int(user_telegram_id),
+            query=str(query or ""),
+            limit=int(limit),
+        )
+
+        return {
+            "success": True,
+            "type": "user_memory_search",
+            "count": len(memories),
+            "memories": memories,
+        }
+
+    async def get_user(
+        self,
+        *,
+        user_telegram_id: int,
+        limit: int = 15,
+        include_inactive: bool = False,
+    ) -> dict[str, Any]:
+
+        memories = await self.manager.get_user_memories(
+            user_telegram_id=int(user_telegram_id),
+            limit=int(limit),
+            include_inactive=bool(include_inactive),
+        )
+
+        return {
+            "success": True,
+            "type": "user_memory",
+            "count": len(memories),
+            "memories": memories,
+        }
+
+    async def forget_user(
+        self,
+        *,
+        memory_id: int,
+    ) -> dict[str, Any]:
+
+        result = await self.manager.forget_user_memory(
+            int(memory_id)
+        )
+
+        return {
+            "success": bool(result),
+            "type": "user_memory_forget",
+            "memory_id": int(memory_id),
+        }
+
+    async def restore_user(
+        self,
+        *,
+        memory_id: int,
+    ) -> dict[str, Any]:
+
+        result = await self.manager.restore_user_memory(
+            int(memory_id)
+        )
+
+        return {
+            "success": bool(result),
+            "type": "user_memory_restore",
+            "memory_id": int(memory_id),
+        }
+
+    async def count_user(
+        self,
+        *,
+        user_telegram_id: int,
+    ) -> dict[str, Any]:
+
+        count = await self.manager.user_memory_count(
+            int(user_telegram_id)
+        )
+
+        return {
+            "success": True,
+            "type": "user_memory_count",
+            "count": int(count),
+        }
+
+    # ============================================================
+    # GROUP MEMORY
+    # ============================================================
+
+    async def save_group(
+        self,
+        *,
+        group_telegram_id: int,
+        memory_type: str,
+        content: str,
+        importance: float = 0.5,
+        confidence: float = 0.8,
+        source_message_id: int | None = None,
+    ) -> dict[str, Any]:
+
+        result = await self.manager.save_group_memory(
+            group_telegram_id=int(group_telegram_id),
+            memory_type=str(memory_type),
+            content=str(content),
+            importance=float(importance),
+            confidence=float(confidence),
+            source_message_id=source_message_id,
+        )
+
+        return {
+            "success": bool(result),
+            "type": "group_memory",
+            "memory": result,
+        }
+
+    async def search_group(
+        self,
+        *,
+        group_telegram_id: int,
+        query: str = "",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+
+        memories = await self.manager.search_group_memory(
+            group_telegram_id=int(group_telegram_id),
+            query=str(query or ""),
+            limit=int(limit),
+        )
+
+        return {
+            "success": True,
+            "type": "group_memory_search",
+            "count": len(memories),
+            "memories": memories,
+        }
+
+    async def get_group(
+        self,
+        *,
+        group_telegram_id: int,
+        limit: int = 15,
+        include_inactive: bool = False,
+    ) -> dict[str, Any]:
+
+        memories = await self.manager.get_group_memories(
+            group_telegram_id=int(group_telegram_id),
+            limit=int(limit),
+            include_inactive=bool(include_inactive),
+        )
+
+        return {
+            "success": True,
+            "type": "group_memory",
+            "count": len(memories),
+            "memories": memories,
+        }
+
+    async def forget_group(
+        self,
+        *,
+        memory_id: int,
+    ) -> dict[str, Any]:
+
+        result = await self.manager.forget_group_memory(
+            int(memory_id)
+        )
+
+        return {
+            "success": bool(result),
+            "type": "group_memory_forget",
+            "memory_id": int(memory_id),
+        }
+
+    async def restore_group(
+        self,
+        *,
+        memory_id: int,
+    ) -> dict[str, Any]:
+
+        result = await self.manager.restore_group_memory(
+            int(memory_id)
+        )
+
+        return {
+            "success": bool(result),
+            "type": "group_memory_restore",
+            "memory_id": int(memory_id),
+        }
+
+    async def count_group(
+        self,
+        *,
+        group_telegram_id: int,
+    ) -> dict[str, Any]:
+
+        count = await self.manager.group_memory_count(
+            int(group_telegram_id)
+        )
+
+        return {
+            "success": True,
+            "type": "group_memory_count",
+            "count": int(count),
+        }
+
+
+# ================================================================
+# GLOBAL TOOL
+# ================================================================
 
 memory_tool = MemoryTool()
 
 
+# ================================================================
+# TOOL HANDLER
+# ================================================================
+
 async def memory_tool_handler(
-    *,
     operation: str,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """
-    Tool Registry uchun yagona entry point.
 
-    operation:
-        save_user
-        save_group
-        search_user
-        search_group
-        get_user
-        get_group
-        forget_user
-        forget_group
-        count_user
-        count_group
-    """
+    operation = str(operation or "").strip().lower()
 
-    operations = {
-        "save_user": memory_tool.save_user_memory,
-        "save_group": memory_tool.save_group_memory,
-        "search_user": memory_tool.search_user_memory,
-        "search_group": memory_tool.search_group_memory,
-        "get_user": memory_tool.get_user_memories,
-        "get_group": memory_tool.get_group_memories,
-        "forget_user": memory_tool.forget_user_memory,
-        "forget_group": memory_tool.forget_group_memory,
-        "count_user": memory_tool.count_user_memory,
-        "count_group": memory_tool.count_group_memory,
-    }
+    try:
 
-    handler = operations.get(operation)
+        # --------------------------------------------------------
+        # USER
+        # --------------------------------------------------------
 
-    if handler is None:
+        if operation == "save_user":
+            return await memory_tool.save_user(**kwargs)
+
+        if operation in {
+            "search_user",
+            "search_user_memory",
+        }:
+            return await memory_tool.search_user(**kwargs)
+
+        if operation in {
+            "get_user",
+            "get_user_memory",
+        }:
+            return await memory_tool.get_user(**kwargs)
+
+        if operation in {
+            "forget_user",
+            "forget_user_memory",
+        }:
+            return await memory_tool.forget_user(**kwargs)
+
+        if operation in {
+            "restore_user",
+            "restore_user_memory",
+        }:
+            return await memory_tool.restore_user(**kwargs)
+
+        if operation in {
+            "count_user",
+            "count_user_memory",
+        }:
+            return await memory_tool.count_user(**kwargs)
+
+        # --------------------------------------------------------
+        # GROUP
+        # --------------------------------------------------------
+
+        if operation == "save_group":
+            return await memory_tool.save_group(**kwargs)
+
+        if operation in {
+            "search_group",
+            "search_group_memory",
+        }:
+            return await memory_tool.search_group(**kwargs)
+
+        if operation in {
+            "get_group",
+            "get_group_memory",
+        }:
+            return await memory_tool.get_group(**kwargs)
+
+        if operation in {
+            "forget_group",
+            "forget_group_memory",
+        }:
+            return await memory_tool.forget_group(**kwargs)
+
+        if operation in {
+            "restore_group",
+            "restore_group_memory",
+        }:
+            return await memory_tool.restore_group(**kwargs)
+
+        if operation in {
+            "count_group",
+            "count_group_memory",
+        }:
+            return await memory_tool.count_group(**kwargs)
+
         return {
             "success": False,
             "error": f"unknown_memory_operation:{operation}",
         }
 
-    try:
-        return await handler(**kwargs)
     except Exception as exc:
         logger.exception(
-            "Memory tool operation failed | operation=%s",
+            "Memory Tool failed | operation=%s",
             operation,
         )
 
         return {
             "success": False,
+            "operation": operation,
             "error": str(exc),
-          }
+        }
+
+
+__all__ = [
+    "MemoryTool",
+    "memory_tool",
+    "memory_tool_handler",
+        ]
