@@ -7,6 +7,15 @@ from app.database.session import SessionFactory
 
 
 class MessageService:
+    """
+    Telegram xabarlarini DBga saqlash servisi.
+
+    Asosiy API:
+        save(...)
+
+    Compatibility API:
+        save_message(...)
+    """
 
     async def save(
         self,
@@ -28,7 +37,7 @@ class MessageService:
                 chat_id=chat_id,
                 user_telegram_id=user_telegram_id,
                 role=role,
-                content=content,
+                content=str(content or ""),
                 message_type=message_type,
                 reply_to_message_id=reply_to_message_id,
                 is_bot_message=is_bot_message,
@@ -41,5 +50,44 @@ class MessageService:
 
             return message
 
+    async def save_message(
+        self,
+        *,
+        telegram_message_id: Optional[int] = None,
+        chat_id: int,
+        user_telegram_id: Optional[int] = None,
+        role: str,
+        content: str,
+        message_type: str = "text",
+        reply_to_message_id: Optional[int] = None,
+        is_bot_message: bool = False,
+    ) -> Message:
+        """
+        Compatibility wrapper.
+
+        Eski handler:
+            save_message(...)
+
+        yangi service:
+            save(...)
+        """
+
+        return await self.save(
+            telegram_message_id=telegram_message_id,
+            chat_id=chat_id,
+            user_telegram_id=user_telegram_id,
+            role=role,
+            content=content,
+            message_type=message_type,
+            reply_to_message_id=reply_to_message_id,
+            is_bot_message=is_bot_message,
+        )
+
 
 message_service = MessageService()
+
+
+__all__ = [
+    "MessageService",
+    "message_service",
+        ]
