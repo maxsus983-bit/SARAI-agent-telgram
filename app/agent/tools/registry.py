@@ -7,9 +7,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-logger = logging.getLogger("sara.agent.tools")
 
-ToolHandler = Callable[..., Any]
+logger = logging.getLogger("sara.agent.tools.registry")
+
+
+ToolHandler = Callable[..., Awaitable[Any]]
 
 
 @dataclass
@@ -32,118 +34,225 @@ class ToolResult:
     duration_seconds: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "tool_name": self.tool_name,
+            "result": self.result,
+            "error": self.error,
+            "duration_seconds": self.duration_seconds,
+            "metadata": self.metadata,
+        }
+
 
 class ToolRegistry:
+    """
+    SARA AI Tool Registry.
+
+    ToolDefinition obyektlarini qabul qiladi:
+
+        registry.register(
+            ToolDefinition(
+                name="memory",
+                description="...",
+                handler=handler,
+            )
+        )
+
+    Shu bilan birga eski uslubni ham qo‘llab-quvvatlaydi:
+
+        registry.register(
+            "memory",
+            "description",
+            handler,
+        )
+    """
+
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
 
-        self.total_calls = 0
-        self.successful_calls = 0
-        self.failed_calls = 0
-
-    # =========================================================
+    # ========================================================
     # REGISTER
-    # =========================================================
+    # ========================================================
 
     def register(
         self,
-        name: str,
-        description: str,
-        handler: ToolHandler,
+        tool: ToolDefinition | str,
+        description: str | None = None,
+        handler: ToolHandler | None = None,
         *,
         enabled: bool = True,
         dangerous: bool = False,
         timeout: float = 30.0,
         metadata: dict[str, Any] | None = None,
-        overwrite: bool = False,
     ) -> ToolDefinition:
 
-        normalized_name = self._normalize_name(name)
+        # ----------------------------------------------------
+        # ToolDefinition obyektidan ro‘yxatdan o‘tkazish
+        # ----------------------------------------------------
 
-        if not normalized_name:
-            raise ValueError("Tool name bo'sh bo'lishi mumkin emas.")
+        if isinstance(tool, ToolDefinition):
 
-        if not callable(handler):
-            raise TypeError(
-                f"Tool handler callable bo'lishi kerak: {normalized_name}"
+            definition = tool
+
+        # ----------------------------------------------------
+        # Eski API:
+        #
+        # register(
+        #     "name",
+        #     "description",
+        #     handler
+        # )
+        # ----------------------------------------------------
+
+        else:
+
+            name = str(tool or "").strip()
+
+            if not name:
+                raise ValueError(
+                    "Tool name cannot be empty."
+                )
+
+            if not description:
+                raise ValueError(
+                    f"Tool description is required: {name}"
+                )
+
+            if handler is None:
+                raise ValueError(
+                    f"Tool handler is required: {name}"
+                )
+
+            if not callable(handler):
+                raise TypeError(
+                    f"Tool handler is not callable: {name}"
+                )
+
+            definition = ToolDefinition(
+                name=name,
+                description=str(description),
+                handler=handler,
+                enabled=enabled,
+                dangerous=dangerous,
+                timeout=float(timeout),
+                metadata=dict(metadata or {}),
             )
 
-        if normalized_name in self._tools and not overwrite:
+        # ----------------------------------------------------
+        # Validation
+        # ----------------------------------------------------
+
+        name = str(
+            definition.name or ""
+        ).strip()
+
+        if not name:
             raise ValueError(
-                f"Tool allaqachon mavjud: {normalized_name}"
+                "Tool name cannot be empty."
             )
 
-        tool = ToolDefinition(
-            name=normalized_name,
-            description=description.strip(),
-            handler=handler,
-            enabled=enabled,
-            dangerous=dangerous,
-            timeout=max(0.1, float(timeout)),
-            metadata=dict(metadata or {}),
+        if not callable(
+            definition.handler
+        ):
+            raise TypeError(
+                f"Tool handler is not callable: {name}"
+            )
+
+        definition.name = name
+
+        if not definition.description:
+            definition.description = (
+                f"SARA AI tool: {name}"
+            )
+
+        definition.timeout = max(
+            0.1,
+            float(definition.timeout),
         )
 
-        self._tools[normalized_name] = tool
+        self._tools[name] = definition
 
         logger.info(
-            "Tool registered | %s | enabled=%s",
-            normalized_name,
-            enabled,
+            "Tool registered | name=%s | enabled=%s | dangerous=%s",
+            name,
+            definition.enabled,
+            definition.dangerous,
         )
 
-        return tool
+        return definition
 
-    def unregister(self, name: str) -> bool:
-        name = self._normalize_name(name)
+    # ========================================================
+    # UNREGISTER
+    # ========================================================
 
-        if name not in self._tools:
-            return False
+    def unregister(
+        self,
+        name: str,
+    ) -> bool:
 
-        self._tools.pop(name, None)
+        name = str(name or "").strip()
 
-        logger.info("Tool unregistered | %s", name)
+        if name in self._tools:
+            del self._tools[name]
 
-        return True
+            logger.info(
+                "Tool unregistered | name=%s",
+                name,
+            )
 
-    # =========================================================
+            return True
+
+        return False
+
+    # ========================================================
     # GET
-    # =========================================================
+    # ========================================================
 
-    def get(self, name: str) -> ToolDefinition | None:
+    def get(
+        self,
+        name: str,
+    ) -> ToolDefinition | None:
+
         return self._tools.get(
-            self._normalize_name(name)
+            str(name or "").strip()
         )
 
-    def exists(self, name: str) -> bool:
+    # ========================================================
+    # EXISTS
+    # ========================================================
+
+    def exists(
+        self,
+        name: str,
+    ) -> bool:
+
         return self.get(name) is not None
 
-    def is_enabled(self, name: str) -> bool:
+    # ========================================================
+    # ENABLED
+    # ========================================================
+
+    def is_enabled(
+        self,
+        name: str,
+    ) -> bool:
+
         tool = self.get(name)
 
-        return bool(tool and tool.enabled)
+        return bool(
+            tool and tool.enabled
+        )
 
-    def list_tools(
+    # ========================================================
+    # ENABLE
+    # ========================================================
+
+    def enable(
         self,
-        *,
-        enabled_only: bool = False,
-    ) -> list[ToolDefinition]:
+        name: str,
+    ) -> bool:
 
-        tools = list(self._tools.values())
-
-        if enabled_only:
-            tools = [
-                tool
-                for tool in tools
-                if tool.enabled
-            ]
-
-        return tools
-
-    # =========================================================
-    # ENABLE / DISABLE
-    # =========================================================
-
-    def enable(self, name: str) -> bool:
         tool = self.get(name)
 
         if tool is None:
@@ -151,9 +260,22 @@ class ToolRegistry:
 
         tool.enabled = True
 
+        logger.info(
+            "Tool enabled | name=%s",
+            name,
+        )
+
         return True
 
-    def disable(self, name: str) -> bool:
+    # ========================================================
+    # DISABLE
+    # ========================================================
+
+    def disable(
+        self,
+        name: str,
+    ) -> bool:
+
         tool = self.get(name)
 
         if tool is None:
@@ -161,186 +283,258 @@ class ToolRegistry:
 
         tool.enabled = False
 
+        logger.info(
+            "Tool disabled | name=%s",
+            name,
+        )
+
         return True
 
-    # =========================================================
+    # ========================================================
+    # DANGEROUS
+    # ========================================================
+
+    def is_dangerous(
+        self,
+        name: str,
+    ) -> bool:
+
+        tool = self.get(name)
+
+        return bool(
+            tool and tool.dangerous
+        )
+
+    # ========================================================
+    # LIST
+    # ========================================================
+
+    def list_tools(
+        self,
+    ) -> list[ToolDefinition]:
+
+        return list(
+            self._tools.values()
+        )
+
+    # ========================================================
     # EXECUTE
-    # =========================================================
+    # ========================================================
 
     async def execute(
         self,
         name: str,
         *,
-        arguments: dict[str, Any] | None = None,
+        require_enabled: bool = True,
         allow_dangerous: bool = False,
+        **kwargs: Any,
     ) -> ToolResult:
 
-        started = time.monotonic()
+        name = str(name or "").strip()
 
-        tool_name = self._normalize_name(name)
+        started = time.perf_counter()
 
-        self.total_calls += 1
+        tool = self.get(name)
 
-        tool = self._tools.get(tool_name)
+        # ----------------------------------------------------
+        # Unknown
+        # ----------------------------------------------------
 
         if tool is None:
-            self.failed_calls += 1
 
             return ToolResult(
                 success=False,
-                tool_name=tool_name,
-                error="tool_not_found",
-                duration_seconds=time.monotonic() - started,
+                tool_name=name,
+                error=f"unknown_tool:{name}",
+                duration_seconds=(
+                    time.perf_counter()
+                    - started
+                ),
             )
 
-        if not tool.enabled:
-            self.failed_calls += 1
+        # ----------------------------------------------------
+        # Disabled
+        # ----------------------------------------------------
+
+        if (
+            require_enabled
+            and not tool.enabled
+        ):
 
             return ToolResult(
                 success=False,
-                tool_name=tool_name,
-                error="tool_disabled",
-                duration_seconds=time.monotonic() - started,
+                tool_name=name,
+                error=f"tool_disabled:{name}",
+                duration_seconds=(
+                    time.perf_counter()
+                    - started
+                ),
             )
 
-        if tool.dangerous and not allow_dangerous:
-            self.failed_calls += 1
+        # ----------------------------------------------------
+        # Dangerous
+        # ----------------------------------------------------
+
+        if (
+            tool.dangerous
+            and not allow_dangerous
+        ):
 
             return ToolResult(
                 success=False,
-                tool_name=tool_name,
-                error="dangerous_tool_blocked",
-                duration_seconds=time.monotonic() - started,
+                tool_name=name,
+                error=(
+                    f"dangerous_tool_blocked:{name}"
+                ),
+                duration_seconds=(
+                    time.perf_counter()
+                    - started
+                ),
             )
 
-        arguments = dict(arguments or {})
+        # ----------------------------------------------------
+        # Execute
+        # ----------------------------------------------------
 
         try:
-            result = await self._call_handler(
-                tool,
-                arguments,
+
+            result = tool.handler(
+                **kwargs
             )
 
-            self.successful_calls += 1
+            # Handler async bo‘lmasa ham
+            # registry yiqilib ketmasin.
+            if inspect.isawaitable(result):
+
+                result = await asyncio.wait_for(
+                    result,
+                    timeout=tool.timeout,
+                )
+
+            duration = (
+                time.perf_counter()
+                - started
+            )
+
+            if isinstance(
+                result,
+                ToolResult,
+            ):
+
+                result.duration_seconds = (
+                    duration
+                )
+
+                return result
 
             return ToolResult(
                 success=True,
-                tool_name=tool_name,
+                tool_name=name,
                 result=result,
-                duration_seconds=time.monotonic() - started,
+                duration_seconds=duration,
             )
 
         except asyncio.TimeoutError:
-            self.failed_calls += 1
 
             return ToolResult(
                 success=False,
-                tool_name=tool_name,
-                error="tool_timeout",
-                duration_seconds=time.monotonic() - started,
+                tool_name=name,
+                error=f"tool_timeout:{name}",
+                duration_seconds=(
+                    time.perf_counter()
+                    - started
+                ),
             )
 
         except Exception as exc:
-            self.failed_calls += 1
 
             logger.exception(
-                "Tool execution failed | %s",
-                tool_name,
+                "Tool execution failed | name=%s",
+                name,
             )
 
             return ToolResult(
                 success=False,
-                tool_name=tool_name,
+                tool_name=name,
                 error=str(exc),
-                duration_seconds=time.monotonic() - started,
+                duration_seconds=(
+                    time.perf_counter()
+                    - started
+                ),
             )
 
-    async def _call_handler(
-        self,
-        tool: ToolDefinition,
-        arguments: dict[str, Any],
-    ) -> Any:
-
-        handler = tool.handler
-
-        if inspect.iscoroutinefunction(handler):
-            return await asyncio.wait_for(
-                handler(**arguments),
-                timeout=tool.timeout,
-            )
-
-        loop = asyncio.get_running_loop()
-
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: handler(**arguments),
-            ),
-            timeout=tool.timeout,
-        )
-
-    # =========================================================
-    # AI CONTEXT
-    # =========================================================
+    # ========================================================
+    # TOOL CONTEXT
+    # ========================================================
 
     def build_tool_context(
         self,
-        *,
-        enabled_only: bool = True,
-    ) -> str:
+    ) -> list[dict[str, Any]]:
 
-        tools = self.list_tools(
-            enabled_only=enabled_only,
-        )
+        tools: list[dict[str, Any]] = []
 
-        if not tools:
-            return (
-                "SARA AVAILABLE TOOLS\n"
-                "====================\n"
-                "Hozircha tool mavjud emas."
+        for tool in self._tools.values():
+
+            if not tool.enabled:
+                continue
+
+            tools.append(
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "dangerous": tool.dangerous,
+                    "metadata": tool.metadata,
+                }
             )
 
-        lines = [
-            "SARA AVAILABLE TOOLS",
-            "====================",
-        ]
+        return tools
 
-        for tool in tools:
-            lines.append(
-                f"- {tool.name}: {tool.description}"
-            )
-
-        return "\n".join(lines)
-
-    # =========================================================
+    # ========================================================
     # STATS
-    # =========================================================
+    # ========================================================
 
-    def stats(self) -> dict[str, Any]:
+    def stats(
+        self,
+    ) -> dict[str, Any]:
 
-        tools = self.list_tools()
+        tools = list(
+            self._tools.values()
+        )
 
         return {
-            "total_tools": len(tools),
-            "enabled_tools": sum(
-                1 for tool in tools if tool.enabled
+            "total": len(tools),
+            "enabled": sum(
+                1
+                for tool in tools
+                if tool.enabled
             ),
-            "disabled_tools": sum(
-                1 for tool in tools if not tool.enabled
+            "disabled": sum(
+                1
+                for tool in tools
+                if not tool.enabled
             ),
-            "total_calls": self.total_calls,
-            "successful_calls": self.successful_calls,
-            "failed_calls": self.failed_calls,
+            "dangerous": sum(
+                1
+                for tool in tools
+                if tool.dangerous
+            ),
+            "tools": [
+                tool.name
+                for tool in tools
+            ],
         }
 
-    @staticmethod
-    def _normalize_name(name: str) -> str:
-        return (
-            str(name)
-            .strip()
-            .lower()
-            .replace(" ", "_")
-        )
 
+# ============================================================
+# GLOBAL REGISTRY
+# ============================================================
 
 tool_registry = ToolRegistry()
+
+
+__all__ = [
+    "ToolDefinition",
+    "ToolResult",
+    "ToolRegistry",
+    "tool_registry",
+        ]
