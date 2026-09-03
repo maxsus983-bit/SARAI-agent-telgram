@@ -1,0 +1,813 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from aiogram.types import Message
+
+from app.agent.agent_context import agent_context_builder
+from app.agent.emotional_state import emotional_state
+from app.agent.loop_guard import loop_guard
+from app.agent.proactive import proactive_agent
+from app.services.privacy_service import privacy_service
+
+
+logger = logging.getLogger("sara.agent.runtime")
+
+
+# ============================================================
+# AGENT RUNTIME CONTEXT
+# ============================================================
+
+
+@dataclass
+class AgentRuntimeContext:
+    """
+    SARA AI Agent Runtime Context.
+
+    Runtime:
+        Telegram message
+        -> context
+        -> emotional state
+        -> privacy
+        -> loop guard
+        -> brain
+        -> AI
+        -> executor
+        -> finalize
+    """
+
+    chat_id: int
+    user_id: int | None
+
+    group_id: int | None = None
+
+    is_group: bool = False
+    is_private: bool = True
+
+    is_bot: bool = False
+    is_bot_message: bool = False
+
+    sara_called: bool = False
+    is_question: bool = False
+    is_reply_to_sara: bool = False
+
+    proactive_allowed: bool = True
+
+    agent_context: str = ""
+    privacy_context: str = ""
+
+    can_use_private_memory: bool = False
+    can_use_group_memory: bool = False
+
+    extra_flags: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    prepared: bool = False
+    finalized: bool = False
+
+    success: bool = False
+    response_sent: bool = False
+    response_text: str = ""
+
+    # ========================================================
+    # PREPARE
+    # ========================================================
+
+    async def prepare(
+        self,
+        *,
+        user_text: str = "",
+        extra_flags: dict[str, Any] | None = None,
+    ) -> "AgentRuntimeContext":
+        """
+        Runtime contextni tayyorlaydi.
+
+        Bu metod:
+        - flags
+        - bot holati
+        - proactive activity
+        - loop guard
+        - emotional state
+        - privacy
+        - agent context
+
+        ni tayyorlaydi.
+        """
+
+        if self.prepared:
+            return self
+
+        if extra_flags:
+            self.extra_flags.update(
+                extra_flags
+            )
+
+        # --------------------------------------------------
+        # FLAGS
+        # --------------------------------------------------
+
+        if "is_question" in self.extra_flags:
+            self.is_question = bool(
+                self.extra_flags["is_question"]
+            )
+
+        if "sara_called" in self.extra_flags:
+            self.sara_called = bool(
+                self.extra_flags["sara_called"]
+            )
+
+        if "is_reply_to_sara" in self.extra_flags:
+            self.is_reply_to_sara = bool(
+                self.extra_flags[
+                    "is_reply_to_sara"
+                ]
+            )
+
+        if "is_bot_message" in self.extra_flags:
+            self.is_bot_message = bool(
+                self.extra_flags[
+                    "is_bot_message"
+                ]
+            )
+
+        if "proactive_allowed" in self.extra_flags:
+            self.proactive_allowed = bool(
+                self.extra_flags[
+                    "proactive_allowed"
+                ]
+            )
+
+        # --------------------------------------------------
+        # BOT DETECTION
+        # --------------------------------------------------
+
+        if self.is_bot_message:
+            self.is_bot = True
+
+        # extra_flags ichidan ham bot holatini olish
+        if self.extra_flags.get("is_bot"):
+            self.is_bot = True
+
+        # --------------------------------------------------
+        # PROACTIVE ACTIVITY
+        # --------------------------------------------------
+
+        try:
+            proactive_agent.record_activity(
+                chat_id=self.chat_id
+            )
+
+        except Exception:
+            logger.exception(
+                "Could not record proactive activity."
+            )
+
+        # --------------------------------------------------
+        # LOOP GUARD
+        # --------------------------------------------------
+
+        try:
+
+            if (
+                not self.is_bot_message
+                and not self.is_bot
+            ):
+
+                loop_guard.register_user_message(
+                    chat_id=self.chat_id
+                )
+
+        except Exception:
+            logger.exception(
+                "Could not register user message."
+            )
+
+        # --------------------------------------------------
+        # EMOTIONAL STATE
+        # --------------------------------------------------
+        #
+        # IMPORTANT:
+        #
+        # EmotionalStateManager.update()
+        # event= parametrini QABUL QILMAYDI.
+        #
+        # Shuning uchun event o'rniga haqiqiy
+        # parametrlar ishlatiladi.
+        #
+        # Bu real inson hissiyoti emas.
+        # Faqat SARA javob uslubini session davomida
+        # moslashtirish uchun.
+        # --------------------------------------------------
+
+        try:
+
+            if self.is_question:
+
+                emotional_state.update(
+                    chat_id=self.chat_id,
+                    user_id=self.user_id,
+                    mood="curious",
+                    intensity_change=0.03,
+                    curiosity_change=0.08,
+                )
+
+            elif self.sara_called:
+
+                emotional_state.update(
+                    chat_id=self.chat_id,
+                    user_id=self.user_id,
+                    mood="engaged",
+                    intensity_change=0.04,
+                    energy_change=0.03,
+                )
+
+            elif self.is_reply_to_sara:
+
+                emotional_state.update(
+                    chat_id=self.chat_id,
+                    user_id=self.user_id,
+                    mood="engaged",
+                    intensity_change=0.02,
+                    friendliness_change=0.0,
+                )
+
+            else:
+
+                emotional_state.update(
+                    chat_id=self.chat_id,
+                    user_id=self.user_id,
+                    mood="neutral",
+                    intensity_change=0.0,
+                    energy_change=0.0,
+                    curiosity_change=0.01,
+                )
+
+        except TypeError:
+            # ------------------------------------------------
+            # Compatibility fallback.
+            #
+            # Agar EmotionalStateManager kelajakda
+            # boshqa signature bilan ishlasa, SARA pipeline
+            # butunlay yiqilib ketmasin.
+            # ------------------------------------------------
+
+            try:
+
+                emotional_state.update(
+                    chat_id=self.chat_id,
+                    user_id=self.user_id,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Could not update emotional state."
+                )
+
+        except Exception:
+            logger.exception(
+                "Could not update emotional state."
+            )
+
+        # --------------------------------------------------
+        # PRIVACY
+        # --------------------------------------------------
+
+        try:
+
+            self.can_use_private_memory = bool(
+                privacy_service.is_private_context(
+                    group_id=self.group_id
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not check private memory permission."
+            )
+
+            self.can_use_private_memory = bool(
+                self.is_private
+            )
+
+        # --------------------------------------------------
+        # GROUP MEMORY
+        # --------------------------------------------------
+
+        self.can_use_group_memory = bool(
+            self.group_id is not None
+            and self.is_group
+        )
+
+        # --------------------------------------------------
+        # PRIVACY CONTEXT
+        # --------------------------------------------------
+
+        if self.is_private:
+
+            self.privacy_context = (
+                "PRIVATE CONTEXT\n"
+                "==============\n"
+                "Bu private chat.\n"
+                "Foydalanuvchining private conversation "
+                "memorysi ishlatilishi mumkin.\n"
+                "Muhim shaxsiy kontekst uzoq muddatli "
+                "memoryga saqlanishi mumkin, lekin "
+                "parol, API key, token va boshqa "
+                "maxfiy credentiallar saqlanmaydi."
+            )
+
+        else:
+
+            self.privacy_context = (
+                "GROUP CONTEXT\n"
+                "=============\n"
+                "Bu group/supergroup context.\n"
+                "Group memory ishlatilishi mumkin.\n"
+                "Private user secrets, passwordlar, "
+                "API keylar, tokenlar va boshqa maxfiy "
+                "credentiallar guruhga oshkor qilinmaydi."
+            )
+
+        # --------------------------------------------------
+        # AGENT CONTEXT
+        # --------------------------------------------------
+
+        try:
+
+            relationship_user_id = (
+                self.user_id
+                if self.user_id is not None
+                else None
+            )
+
+            self.agent_context = (
+                await agent_context_builder.build(
+                    chat_id=self.chat_id,
+                    user_id=(
+                        self.user_id
+                        if self.user_id is not None
+                        else 0
+                    ),
+                    relationship_user_id=(
+                        relationship_user_id
+                        if relationship_user_id is not None
+                        and not self.is_bot
+                        else None
+                    ),
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not build agent context."
+            )
+
+            self.agent_context = (
+                "SARA AGENT CONTEXT\n"
+                "==================\n"
+                "Hozircha qo'shimcha context mavjud emas."
+            )
+
+        # --------------------------------------------------
+        # PREPARED
+        # --------------------------------------------------
+
+        self.prepared = True
+
+        logger.debug(
+            "Runtime prepared | "
+            "chat=%s user=%s group=%s "
+            "private=%s group_chat=%s bot=%s "
+            "question=%s sara_called=%s",
+            self.chat_id,
+            self.user_id,
+            self.group_id,
+            self.is_private,
+            self.is_group,
+            self.is_bot_message,
+            self.is_question,
+            self.sara_called,
+        )
+
+        return self
+
+    # ========================================================
+    # BUILD CONTEXT
+    # ========================================================
+
+    def build_agent_context(
+        self,
+    ) -> dict[str, Any]:
+        """
+        AI Engine / Brain / Orchestrator uchun
+        runtime context.
+        """
+
+        return {
+            "chat_id": self.chat_id,
+            "user_id": self.user_id,
+            "group_id": self.group_id,
+
+            "is_group": self.is_group,
+            "is_private": self.is_private,
+
+            "is_bot": self.is_bot,
+            "is_bot_message": self.is_bot_message,
+
+            "sara_called": self.sara_called,
+            "is_question": self.is_question,
+            "is_reply_to_sara": (
+                self.is_reply_to_sara
+            ),
+
+            "proactive_allowed": (
+                self.proactive_allowed
+            ),
+
+            "agent_context": self.agent_context,
+
+            "privacy_context": (
+                self.privacy_context
+            ),
+
+            "can_use_private_memory": (
+                self.can_use_private_memory
+            ),
+
+            "can_use_group_memory": (
+                self.can_use_group_memory
+            ),
+
+            "prepared": self.prepared,
+
+            "finalized": self.finalized,
+
+            "success": self.success,
+
+            "response_sent": (
+                self.response_sent
+            ),
+
+            "extra_flags": dict(
+                self.extra_flags
+            ),
+        }
+
+    # ========================================================
+    # CAN RESPOND
+    # ========================================================
+
+    def can_respond(self) -> bool:
+        """
+        SARA hozir javob berishi mumkinligini tekshiradi.
+        """
+
+        # Botning o'z xabariga javob bermaslik
+        if self.is_bot_message:
+            return False
+
+        # Proactive mode o'chirilgan bo'lsa
+        if not self.proactive_allowed:
+            return False
+
+        try:
+
+            return bool(
+                loop_guard.can_respond(
+                    chat_id=self.chat_id
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not check loop guard."
+            )
+
+            # Guard ishlamasa pipeline'ni
+            # butunlay to'xtatmaymiz.
+            return True
+
+    # ========================================================
+    # REGISTER RESPONSE
+    # ========================================================
+
+    def register_response(
+        self,
+        *,
+        response_text: str = "",
+    ) -> None:
+        """
+        SARA javob berganidan keyin runtime state
+        va loop/proactive state yangilanadi.
+        """
+
+        response_text = (
+            response_text or ""
+        ).strip()
+
+        self.response_text = response_text
+
+        try:
+
+            loop_guard.register_response(
+                chat_id=self.chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not register agent response."
+            )
+
+        try:
+
+            loop_guard.register_bot_message(
+                chat_id=self.chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not register bot message."
+            )
+
+        try:
+
+            proactive_agent.record_response(
+                chat_id=self.chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not record proactive response."
+            )
+
+    # ========================================================
+    # FINALIZE
+    # ========================================================
+
+    async def finalize(
+        self,
+        *,
+        response_text: str = "",
+        sent: bool = False,
+        success: bool = True,
+    ) -> None:
+        """
+        Agent processing yakunlanadi.
+
+        Compatibility:
+            finalize(response_text=..., sent=...)
+            finalize(response_text=..., success=...)
+            finalize(response_text=..., sent=..., success=...)
+        """
+
+        if self.finalized:
+            return
+
+        response_text = (
+            response_text or ""
+        ).strip()
+
+        self.response_text = response_text
+
+        self.success = bool(success)
+
+        self.response_sent = bool(sent)
+
+        # Agar response bor bo'lsa, lekin sent flag
+        # berilmagan bo'lsa ham response state'ni
+        # hisobga olamiz.
+        if response_text and not sent:
+            self.response_sent = False
+
+        if (
+            sent
+            or response_text
+        ):
+
+            self.register_response(
+                response_text=response_text
+            )
+
+        self.finalized = True
+
+        logger.debug(
+            "Runtime finalized | "
+            "chat=%s user=%s "
+            "success=%s sent=%s "
+            "response_length=%s",
+            self.chat_id,
+            self.user_id,
+            self.success,
+            self.response_sent,
+            len(response_text),
+        )
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset_state(self) -> None:
+        """
+        Runtime local state reset.
+        """
+
+        self.agent_context = ""
+        self.privacy_context = ""
+
+        self.can_use_private_memory = False
+        self.can_use_group_memory = False
+
+        self.prepared = False
+        self.finalized = False
+
+        self.success = False
+        self.response_sent = False
+        self.response_text = ""
+
+        self.extra_flags.clear()
+
+
+# ============================================================
+# LEGACY COMPATIBILITY WRAPPER
+# ============================================================
+
+
+class AgentRuntime:
+    """
+    Legacy compatibility wrapper.
+
+    Eski kodlar AgentRuntime ishlatsa ham,
+    yangi AgentRuntimeContext bilan ishlaydi.
+    """
+
+    async def prepare(
+        self,
+        *,
+        message: Message,
+        user_id: int,
+        group_id: int | None = None,
+        sara_called: bool = False,
+        is_question: bool = False,
+        is_reply_to_sara: bool = False,
+        is_bot_message: bool = False,
+        proactive_allowed: bool = True,
+    ) -> AgentRuntimeContext:
+
+        is_private = (
+            group_id is None
+            and message.chat.type == "private"
+        )
+
+        is_group = (
+            group_id is not None
+            or message.chat.type
+            in {
+                "group",
+                "supergroup",
+            }
+        )
+
+        is_bot = bool(
+            message.from_user
+            and message.from_user.is_bot
+        )
+
+        runtime = AgentRuntimeContext(
+            chat_id=int(
+                message.chat.id
+            ),
+
+            user_id=int(
+                user_id
+            ),
+
+            group_id=group_id,
+
+            is_group=is_group,
+
+            is_private=is_private,
+
+            is_bot=is_bot,
+
+            is_bot_message=(
+                is_bot_message
+            ),
+
+            sara_called=sara_called,
+
+            is_question=is_question,
+
+            is_reply_to_sara=(
+                is_reply_to_sara
+            ),
+
+            proactive_allowed=(
+                proactive_allowed
+            ),
+        )
+
+        text = (
+            message.text
+            or message.caption
+            or ""
+        )
+
+        await runtime.prepare(
+            user_text=text,
+            extra_flags={
+                "source": (
+                    "legacy_agent_runtime"
+                ),
+
+                "is_question": (
+                    is_question
+                ),
+
+                "sara_called": (
+                    sara_called
+                ),
+
+                "is_reply_to_sara": (
+                    is_reply_to_sara
+                ),
+
+                "is_bot_message": (
+                    is_bot_message
+                ),
+
+                "proactive_allowed": (
+                    proactive_allowed
+                ),
+            },
+        )
+
+        return runtime
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset(
+        self,
+        chat_id: int,
+    ) -> None:
+
+        try:
+
+            loop_guard.reset(
+                chat_id=chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not reset loop guard."
+            )
+
+        try:
+
+            proactive_agent.reset(
+                chat_id=chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not reset proactive state."
+            )
+
+        try:
+
+            emotional_state.reset(
+                chat_id=chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not reset emotional state."
+            )
+
+
+# ============================================================
+# GLOBAL
+# ============================================================
+
+
+agent_runtime = AgentRuntime()
+
+
+__all__ = [
+    "AgentRuntimeContext",
+    "AgentRuntime",
+    "agent_runtime",
+]
