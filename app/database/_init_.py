@@ -1,1 +1,4 @@
-"""SARA AI database package."""
+"""
+SARA AI Database Package
+Persistent database and memory storage.
+"""
